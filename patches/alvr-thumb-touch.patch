@@ -1,0 +1,32 @@
+diff --git a/alvr/server_openvr/cpp/alvr_server/Controller.cpp b/alvr/server_openvr/cpp/alvr_server/Controller.cpp
+index c17cd98..bb85ee9 100644
+--- a/alvr/server_openvr/cpp/alvr_server/Controller.cpp
++++ b/alvr/server_openvr/cpp/alvr_server/Controller.cpp
+@@ -372,20 +372,13 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
+             m_buttonHandles[ALVR_INPUT_FINGER_MIDDLE], m_gripValue, 0.0
+         );
+ 
+-        // Ring and pinky fingers are not tracked. Infer a more natural pose.
+-        if (m_currentThumbTouch) {
+-            vr_driver_input->UpdateScalarComponent(m_buttonHandles[ALVR_INPUT_FINGER_RING], 1, 0.0);
+-            vr_driver_input->UpdateScalarComponent(
+-                m_buttonHandles[ALVR_INPUT_FINGER_PINKY], 1, 0.0
+-            );
+-        } else {
+-            vr_driver_input->UpdateScalarComponent(
+-                m_buttonHandles[ALVR_INPUT_FINGER_RING], m_gripValue, 0.0
+-            );
+-            vr_driver_input->UpdateScalarComponent(
+-                m_buttonHandles[ALVR_INPUT_FINGER_PINKY], m_gripValue, 0.0
+-            );
+-        }
++        // Infer untracked fingers from grip, independently of thumb contact.
++        vr_driver_input->UpdateScalarComponent(
++            m_buttonHandles[ALVR_INPUT_FINGER_RING], m_gripValue, 0.0
++        );
++        vr_driver_input->UpdateScalarComponent(
++            m_buttonHandles[ALVR_INPUT_FINGER_PINKY], m_gripValue, 0.0
++        );
+ 
+         vr::VRBoneTransform_t boneTransforms[SKELETON_BONE_COUNT];
+ 

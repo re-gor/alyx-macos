@@ -1,0 +1,36 @@
+diff --git a/alvr/server_openvr/cpp/alvr_server/Utils.h b/alvr/server_openvr/cpp/alvr_server/Utils.h
+index 68a9dd5..48409c7 100644
+--- a/alvr/server_openvr/cpp/alvr_server/Utils.h
++++ b/alvr/server_openvr/cpp/alvr_server/Utils.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <chrono>
++#include <cwchar>
+ #ifdef _WIN32
+ #pragma warning(disable : 4005)
+ #include <WinSock2.h>
+@@ -39,7 +40,7 @@ inline uint64_t GetTimestampUs() {
+ inline std::wstring GetErrorStr(HRESULT hr) {
+     wchar_t* s = NULL;
+     std::wstring ret;
+-    FormatMessageW(
++    DWORD count = FormatMessageW(
+         FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+         NULL,
+         hr,
+@@ -48,7 +49,13 @@ inline std::wstring GetErrorStr(HRESULT hr) {
+         0,
+         NULL
+     );
+-    ret = s;
++    if (count && s) {
++        ret.assign(s, count);
++    } else {
++        wchar_t fallback[32];
++        swprintf(fallback, 32, L"Windows status 0x%08x", static_cast<unsigned>(hr));
++        ret = fallback;
++    }
+     LocalFree(s);
+ 
+     if (ret.size() >= 1 && ret[ret.size() - 1] == L'\n') {

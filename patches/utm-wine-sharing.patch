@@ -1,0 +1,1442 @@
+diff --git a/meson.build b/meson.build
+index a72d9c0..1543039 100644
+--- a/meson.build
++++ b/meson.build
+@@ -68,6 +68,7 @@ dmn_sources = files(
+   'src/dmn_fence_d3d.cpp',
+   'src/dmn_kmtx.cpp',
+   'src/dmn_com_hooks.cpp',
++  'src/dmn_wine_handles.cpp',
+   'src/dmn_dxil_reflect.cpp',
+ )
+ 
+diff --git a/src/dmn_com_hooks.cpp b/src/dmn_com_hooks.cpp
+index c62f8b1..46eca61 100644
+--- a/src/dmn_com_hooks.cpp
++++ b/src/dmn_com_hooks.cpp
+@@ -51,6 +51,7 @@
+ #include "dmn_log.h"
+ #include "dmn_private.h"
+ #include "dmn_share.h"
++#include "dmn_wine_handles.h"
+ #include "dmn_sparse.h"
+ 
+ /* D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, absent from the vendored d3d12.h.
+@@ -179,6 +180,8 @@ std::mutex g_pod_mtx;
+ std::unordered_map<void*, void*> g_pods; /* identity -> malloc'd POD */
+ 
+ HRESULT vend_pod(void* id, const void* src, size_t n, HANDLE* out) {
++    if (dmn_wine_handles_enabled())
++        return dmn_wine_export_handle(id, src, n, reinterpret_cast<void**>(out));
+     std::lock_guard<std::mutex> lk(g_pod_mtx);
+     void*& slot = g_pods[id];
+     if (!slot)
+@@ -193,6 +196,7 @@ HRESULT vend_pod(void* id, const void* src, size_t n, HANDLE* out) {
+ }
+ 
+ void free_pod(void* id) {
++    dmn_wine_evict_handle(id);
+     std::lock_guard<std::mutex> lk(g_pod_mtx);
+     auto it = g_pods.find(id);
+     if (it != g_pods.end()) {
+@@ -959,9 +963,16 @@ void record_texture_pod(IUnknown* tex, const dmn_shared_texture_handle& pod,
+         g_tex_reg[id] = rec;
+     }
+     patch_shared_resource_exports(tex);
+-    if (wants_kmtx(rec.misc_flags))
++    if (wants_kmtx(rec.misc_flags)) {
++        // Both callers of this function pass a D3D11 texture. Keep the mutex's
++        // GPU barrier on that texture's immediate context; it must not retain
++        // the texture itself, which would prevent the eviction sentinel firing.
++        ID3D11Device* device = nullptr;
++        reinterpret_cast<ID3D11DeviceChild*>(tex)->GetDevice(&device);
+         dmn_kmtx_register(id, rec.fd, dmn_share_page_align((size_t)rec.size),
+-                          init_kmtx);
++                          init_kmtx, device);
++        if (device) device->Release();
++    }
+     attach_evict_sentinel(tex, id, EV_TEX);
+     DMN_INFO("hooks: recorded shared texture identity=%p fd=%d %ux%u stride=%llu",
+              id, rec.fd, rec.width, rec.height, (unsigned long long)rec.stride);
+@@ -1349,7 +1360,28 @@ HRESULT import_heap_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* pod
+  * "this handle's geometry is invalid" into whatever D3DMetal says about a
+  * handle it cannot parse. */
+ bool open_shared_d3d11(ID3D11Device* dev, HANDLE handle, REFIID iid, void** out,
+-                       HRESULT* out_hr) {
++                        HRESULT* out_hr) {
++    if (dmn_wine_is_handle(handle)) {
++        if (out) *out = nullptr;
++        alignas(8) char wire[128]{};
++        size_t size = 0;
++        int fd = -1;
++        *out_hr = dmn_wine_import_handle(handle, wire, sizeof(wire), &size, &fd);
++        if (FAILED(*out_hr)) return true;
++        uint32_t magic = *reinterpret_cast<uint32_t*>(wire);
++        if (magic == DMN_SHARED_BUFFER_MAGIC && size == sizeof(dmn_shared_buffer_handle))
++            *out_hr = import_buffer_d3d11(dev,
++                reinterpret_cast<dmn_shared_buffer_handle*>(wire), iid, out);
++        else if (magic == DMN_SHARED_TEXTURE_MAGIC && size == sizeof(dmn_shared_texture_handle))
++            *out_hr = import_texture_d3d11(dev,
++                reinterpret_cast<dmn_shared_texture_handle*>(wire), iid, out);
++        else
++            *out_hr = E_INVALIDARG;
++        close(fd);
++        return true;
++    }
++    if (dmn_wine_handles_enabled() && reinterpret_cast<uintptr_t>(handle) <= UINT32_MAX)
++        return false; // Foreign numeric handles are not native POD pointers.
+     uint32_t magic = *reinterpret_cast<uint32_t*>(handle);
+     if (magic == DMN_SHARED_BUFFER_MAGIC) {
+         *out_hr = import_buffer_d3d11(
+@@ -1365,6 +1397,40 @@ bool open_shared_d3d11(ID3D11Device* dev, HANDLE handle, REFIID iid, void** out,
+ }
+ 
+ /* == D3D11 producer thunks ================================================= */
++template<typename Desc>
++bool producer_defined_initial_data(const Desc& desc, bool has_output,
++                                   D3D11_SUBRESOURCE_DATA* data) {
++    // A producer created without initial data can defer its first zero-fill
++    // until GPU use, after another process has already written the allocation.
++    // Mark supported single-surface colour textures defined using the same
++    // intercepted sentinel upload as imports. Preserve caller data and shapes
++    // whose mip/slice/sample layout this adapter cannot reproduce.
++    if (!has_output || desc.MipLevels != 1 || desc.ArraySize != 1 ||
++        desc.SampleDesc.Count != 1 || desc.Usage != D3D11_USAGE_DEFAULT ||
++        !desc.Width || !desc.Height)
++        return false;
++    uint32_t support = 0;
++    if (!dmn_format_support((uint32_t)desc.Format, &support) ||
++        !(support & DMN_FMT_SUPPORT_RENDER_TARGET))
++        return false;
++    // Sixteen bytes is the maximum texel size for these colour formats.
++    // A conservative padded pitch avoids duplicating the Metal format table.
++    // Keep even an unintercepted upload within the sentinel's readable span.
++    constexpr uint64_t sentinel_span = uint64_t(256) << 20;
++    const uint64_t pitch = uint64_t(desc.Width) * 16;
++    uint64_t span = 0;
++    if (pitch > UINT32_MAX ||
++        __builtin_mul_overflow(pitch, uint64_t(desc.Height), &span) ||
++        span > sentinel_span)
++        return false;
++    const void* sentinel = dmn_share_init_data_sentinel();
++    if (!sentinel) return false;
++    data->pSysMem = sentinel;
++    data->SysMemPitch = (UINT)pitch;
++    data->SysMemSlicePitch = (UINT)span;
++    return true;
++}
++
+ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
+         ID3D11Device* This, const D3D11_TEXTURE2D_DESC* desc,
+         const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out) {
+@@ -1378,8 +1444,11 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
+ 
+     DMN_INFO("hooks: CreateTexture2D MISC_SHARED %ux%u fmt=%u", desc->Width,
+              desc->Height, desc->Format);
++    D3D11_SUBRESOURCE_DATA defined{};
++    const bool synthetic = !init &&
++        producer_defined_initial_data(*desc, out != nullptr, &defined);
+     dmn_share_arm_producer(kmtx_extra(desc->MiscFlags));
+-    HRESULT hr = orig(This, desc, init, out);
++    HRESULT hr = orig(This, desc, synthetic ? &defined : init, out);
+     DmnShareArm arm{};
+     bool captured = dmn_share_disarm(&arm);
+     /* A null `out` is a parameter-validation call: nothing was allocated, so
+@@ -1391,6 +1460,11 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
+     if (!captured)
+         return fail_unshared("CreateTexture2D MISC_SHARED",
+                              reinterpret_cast<void**>(out));
++    if (synthetic && !arm.init_dropped) {
++        arm_fd_close(arm);
++        return fail_unshared("CreateTexture2D producer sentinel was not intercepted",
++                             reinterpret_cast<void**>(out));
++    }
+     record_texture(*out, *desc, arm);
+     arm_fd_close(arm);
+     return hr;
+@@ -1407,8 +1481,11 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D1(
+ 
+     DMN_INFO("hooks: CreateTexture2D1 MISC_SHARED %ux%u fmt=%u", desc->Width,
+              desc->Height, desc->Format);
++    D3D11_SUBRESOURCE_DATA defined{};
++    const bool synthetic = !init &&
++        producer_defined_initial_data(*desc, out != nullptr, &defined);
+     dmn_share_arm_producer(kmtx_extra(desc->MiscFlags));
+-    HRESULT hr = orig(This, desc, init, out);
++    HRESULT hr = orig(This, desc, synthetic ? &defined : init, out);
+     DmnShareArm arm{};
+     bool captured = dmn_share_disarm(&arm);
+     if (FAILED(hr) || !out || !*out) {
+@@ -1418,6 +1495,11 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D1(
+     if (!captured)
+         return fail_unshared("CreateTexture2D1 MISC_SHARED",
+                              reinterpret_cast<void**>(out));
++    if (synthetic && !arm.init_dropped) {
++        arm_fd_close(arm);
++        return fail_unshared("CreateTexture2D1 producer sentinel was not intercepted",
++                             reinterpret_cast<void**>(out));
++    }
+     /* Flatten DESC1 -> DESC for the POD (drops only TextureLayout). */
+     D3D11_TEXTURE2D_DESC d{};
+     d.Width = desc->Width; d.Height = desc->Height;
+diff --git a/src/dmn_kmtx.cpp b/src/dmn_kmtx.cpp
+index 371119b..c87cfad 100644
+--- a/src/dmn_kmtx.cpp
++++ b/src/dmn_kmtx.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <sched.h>
+ #include <time.h>
++#include <unistd.h>
+ 
+ #include <atomic>
+ #include <cstdint>
+@@ -57,6 +58,13 @@ struct VendedKmtx {
+     KmtxShared* state;   /* inside `map` */
+     void* map;
+     size_t map_size;
++    // Own the device/query, never the texture or a persistent external context
++    // reference. A bound context can retain this texture; keeping its external
++    // reference here could add a mutex -> context -> texture cycle.
++    ID3D11Device* device = nullptr;
++    ID3D11Query* gpu_done = nullptr;
++    HRESULT gpu_setup = E_FAIL;
++    std::mutex release_mutex; // serialize reuse of this object's event query
+ };
+ 
+ HRESULT STDMETHODCALLTYPE km_QueryInterface(VendedKmtx* self, REFIID riid, void** ppv) {
+@@ -81,6 +89,8 @@ ULONG STDMETHODCALLTYPE km_Release(VendedKmtx* self) {
+      * destruction); destruction happens when the app's refs also drain. */
+     ULONG r = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+     if (r == 0) {
++        if (self->gpu_done) self->gpu_done->Release();
++        if (self->device) self->device->Release();
+         dmn_share_unmap(self->map, self->map_size);
+         delete self;
+     }
+@@ -99,20 +109,29 @@ HRESULT STDMETHODCALLTYPE km_GetDevice(VendedKmtx*, REFIID, void** ppv) {
+ }
+ 
+ HRESULT STDMETHODCALLTYPE km_AcquireSync(VendedKmtx* self, UINT64 key, DWORD ms) {
++    static std::atomic<unsigned> trace_count{0};
++    bool trace = trace_count.fetch_add(1) < 16;
+     KmtxShared* s = self->state;
+     const bool infinite = (ms == 0xffffffffu);
+     const uint64_t deadline = infinite ? 0 : now_ms() + ms;
+     uint32_t spins = 0;
+     for (;;) {
+         kmtx_lock(s);
++        if (trace && spins == 0)
++            DMN_INFO("kmtx: acquire pid=%d want=%llu key=%llu held=%u timeout=%u",
++                     getpid(), (unsigned long long)key,
++                     (unsigned long long)s->key, s->acquired, ms);
+         if (!s->acquired && s->key == key) {
+             s->acquired = 1;
+             kmtx_unlock(s);
++            if (trace) DMN_INFO("kmtx: acquired pid=%d key=%llu", getpid(), (unsigned long long)key);
+             return S_OK;
+         }
+         kmtx_unlock(s);
+-        if (!infinite && now_ms() >= deadline)
++        if (!infinite && now_ms() >= deadline) {
++            if (trace) DMN_INFO("kmtx: timed out pid=%d want=%llu", getpid(), (unsigned long long)key);
+             return (HRESULT)WAIT_TIMEOUT;
++        }
+         if (spins < 128) {
+             sched_yield();
+             spins++;
+@@ -124,12 +143,56 @@ HRESULT STDMETHODCALLTYPE km_AcquireSync(VendedKmtx* self, UINT64 key, DWORD ms)
+ }
+ 
+ HRESULT STDMETHODCALLTYPE km_ReleaseSync(VendedKmtx* self, UINT64 key) {
++    static std::atomic<unsigned> trace_count{0};
++    std::lock_guard<std::mutex> release_guard(self->release_mutex);
+     KmtxShared* s = self->state;
+     kmtx_lock(s);
++    if (trace_count.fetch_add(1) < 16)
++        DMN_INFO("kmtx: release pid=%d key=%llu held=%u", getpid(),
++                 (unsigned long long)key, s->acquired);
+     if (!s->acquired) {
+         kmtx_unlock(s);
+         return DXGI_ERROR_INVALID_CALL;
+     }
++    kmtx_unlock(s);
++
++    // Flush submits the owning process's writes, but does not complete them.
++    // Publishing a CPU key immediately after Flush lets the peer's GPU copy
++    // race those writes. Keep the shared mutex acquired until an EVENT query
++    // after the preceding commands reports completion. Do not hold the shared
++    // spinlock during this bounded wait; a peer can still observe a timeout.
++    if (FAILED(self->gpu_setup)) return self->gpu_setup;
++    ID3D11DeviceContext* context = nullptr;
++    self->device->GetImmediateContext(&context);
++    if (!context) return E_FAIL;
++    struct ContextRelease {
++        ID3D11DeviceContext* value;
++        ~ContextRelease() { value->Release(); }
++    } context_ref{context};
++    context->End(self->gpu_done);
++    context->Flush();
++    const uint64_t deadline = now_ms() + 5000;
++    for (;;) {
++        BOOL complete = FALSE;
++        HRESULT hr = context->GetData(self->gpu_done, &complete,
++                                      sizeof(complete), 0);
++        if (FAILED(hr)) {
++            DMN_ERROR("kmtx: GPU completion query failed 0x%08x; key not released",
++                      (unsigned)hr);
++            return hr;
++        }
++        if (hr == S_OK && complete) break;
++        HRESULT removed = self->device->GetDeviceRemovedReason();
++        if (FAILED(removed)) return removed;
++        if (now_ms() >= deadline) {
++            DMN_ERROR("kmtx: GPU completion timed out; key not released");
++            return static_cast<HRESULT>(0x80070102u); // HRESULT_FROM_WIN32(WAIT_TIMEOUT)
++        }
++        struct timespec ns = {0, 200 * 1000};
++        nanosleep(&ns, nullptr);
++    }
++
++    kmtx_lock(s);
+     s->acquired = 0;
+     s->key = key;
+     kmtx_unlock(s);
+@@ -148,8 +211,9 @@ std::unordered_map<void*, VendedKmtx*> g_km_reg; /* texture identity -> mutex */
+ 
+ } // namespace
+ 
+-bool dmn_kmtx_register(void* texture_identity, int fd, uint64_t offset, bool init) {
+-    if (!texture_identity || fd < 0)
++bool dmn_kmtx_register(void* texture_identity, int fd, uint64_t offset, bool init,
++                       ID3D11Device* device) {
++    if (!texture_identity || fd < 0 || !device)
+         return false;
+     {
+         std::lock_guard<std::mutex> lk(g_km_mtx);
+@@ -184,6 +248,13 @@ bool dmn_kmtx_register(void* texture_identity, int fd, uint64_t offset, bool ini
+     km->state = s;
+     km->map = map;
+     km->map_size = map_size;
++    km->device = device;
++    device->AddRef();
++    D3D11_QUERY_DESC desc{D3D11_QUERY_EVENT, 0};
++    km->gpu_setup = device->CreateQuery(&desc, &km->gpu_done);
++    if (FAILED(km->gpu_setup))
++        DMN_ERROR("kmtx: GPU completion setup failed 0x%08x; ReleaseSync will fail",
++                  (unsigned)km->gpu_setup);
+     {
+         std::lock_guard<std::mutex> lk(g_km_mtx);
+         g_km_reg[texture_identity] = km;
+diff --git a/src/dmn_kmtx.h b/src/dmn_kmtx.h
+index 1f3a85e..fc3b7b1 100644
+--- a/src/dmn_kmtx.h
++++ b/src/dmn_kmtx.h
+@@ -14,6 +14,9 @@
+  * ReleaseSync(K) releases it with key K for the next acquirer. Waiting is
+  * poll-based with the same backoff as the shared fence (no cross-process
+  * futex on macOS).
++ * ReleaseSync completes preceding commands on the owning immediate context
++ * before publishing the key. This uses a blocking EVENT query, bounded to five
++ * seconds; GPU errors/timeouts keep the mutex acquired and return an error.
+  *
+  * MS-ABI TU (vends a real IDXGIKeyedMutex COM object); dmn_com_hooks.cpp
+  * routes texture QueryInterface here.
+@@ -22,6 +25,7 @@
+ #pragma once
+ 
+ #include <dxgi1_2.h>
++#include <d3d11.h>
+ 
+ #include <cstdint>
+ 
+@@ -30,7 +34,8 @@
+  * side (init=false): attach to an existing page. `fd` is the texture's shm
+  * fd; `offset` the page's byte offset. Returns false on failure (the texture
+  * still shares; only keyed-mutex sync is unavailable). */
+-bool dmn_kmtx_register(void* texture_identity, int fd, uint64_t offset, bool init);
++bool dmn_kmtx_register(void* texture_identity, int fd, uint64_t offset, bool init,
++                       ID3D11Device* device);
+ 
+ /* The vended IDXGIKeyedMutex for a texture identity, AddRef'd, or NULL.
+  * Called from the texture QueryInterface hook. */
+diff --git a/src/dmn_share.h b/src/dmn_share.h
+index 16ee4df..8056e69 100644
+--- a/src/dmn_share.h
++++ b/src/dmn_share.h
+@@ -103,7 +103,7 @@ struct DmnShareArm {
+     bool     zero_filled;   /* out: the create zeroed aliased bytes */
+ 
+     /* Filled by the swizzle on capture. */
+-    bool     init_dropped;  /* consumer: the sentinel initial-data upload was
++    bool     init_dropped;  /* producer/import: the sentinel initial-data upload was
+                                intercepted and discarded (see
+                                dmn_share_init_data_sentinel) */
+     bool     captured;
+@@ -164,7 +164,8 @@ bool dmn_share_is_armed(void);
+  * loads. No-op-safe to call repeatedly. */
+ void dmn_share_install_swizzles(void);
+ 
+-/* pSysMem for the D3D11_SUBRESOURCE_DATA a consumer reconstruct must pass.
++/* pSysMem for intercepted D3D11_SUBRESOURCE_DATA used by imports and supported
++ * fresh shared producers without caller initial data.
+  *
+  * A texture created with no initial data is undefined as far as D3DMetal is
+  * concerned, and the first render pass that attaches it loads with a clear
+diff --git a/src/dmn_share_metal.mm b/src/dmn_share_metal.mm
+index ab7894b..dff6ef5 100644
+--- a/src/dmn_share_metal.mm
++++ b/src/dmn_share_metal.mm
+@@ -554,9 +554,10 @@ void zero_fill_check() {
+ IMP lookup_orig(Class c, SEL sel);
+ 
+ /* == Initial-data sentinel ================================================
+- * See dmn_share_init_data_sentinel() in dmn_share.h for why a consumer
+- * reconstruct passes initial data at all. This is the pointer it passes, and
+- * the interception that keeps the data from ever being written.
++ * Imports and fresh single-surface producers use this to mark the D3D texture
++ * defined without uploading bytes. Otherwise a producer's first GPU use can
++ * zero an allocation after a peer has already written it. This is the pointer
++ * they pass, and the interception that keeps it from ever being written.
+  *
+  * The pointer is a large, lazily-backed read-only zero mapping rather than a
+  * made-up address. It has to be recognisable, and it has to be safe to read:
+@@ -2092,6 +2093,17 @@ id swz_cb_cced(id self, SEL _cmd, NSUInteger dispatchType) {
+ id swz_tex_new_view(id self, SEL _cmd, MTLPixelFormat fmt,
+                     MTLTextureType type, NSRange levels, NSRange slices,
+                     MTLTextureSwizzleChannels swz) {
++    IMP orig = lookup_orig(object_getClass(self), _cmd);
++    if (!orig)
++        return nil;
++    using NewView = id (*)(id, SEL, MTLPixelFormat, MTLTextureType, NSRange,
++                          NSRange, MTLTextureSwizzleChannels);
++    auto original = reinterpret_cast<NewView>(orig);
++    // This swizzle covers the whole Metal class. Ordinary textures must keep
++    // native range semantics, including six face slices per cube. Only our
++    // substituted linear textures need the defensive range clamp below.
++    if (!objc_getAssociatedObject(self, kDmnShadowHeapKey))
++        return original(self, _cmd, fmt, type, levels, slices, swz);
+     id<MTLTexture> tex = (id<MTLTexture>)self;
+     const NSUInteger have_slices =
+         tex.textureType == MTLTextureType3D ? 1 : tex.arrayLength;
+@@ -2124,12 +2136,7 @@ id swz_tex_new_view(id self, SEL _cmd, MTLPixelFormat fmt,
+             levels.length = 1;
+     }
+ 
+-    IMP orig = lookup_orig(object_getClass(self), _cmd);
+-    if (!orig)
+-        return nil;
+-    return ((id (*)(id, SEL, MTLPixelFormat, MTLTextureType, NSRange, NSRange,
+-                    MTLTextureSwizzleChannels))orig)(
+-        self, _cmd, fmt, type, levels, slices, swz);
++    return original(self, _cmd, fmt, type, levels, slices, swz);
+ }
+ 
+ /* -heap is an MTLResource method, so its implementing class may be a base
+diff --git a/tests/keyed_mutex_test.cpp b/tests/keyed_mutex_test.cpp
+index 8203b84..9a10071 100644
+--- a/tests/keyed_mutex_test.cpp
++++ b/tests/keyed_mutex_test.cpp
+@@ -63,6 +63,27 @@ Com<ID3D11Device> make_device() {
+     return dev;
+ }
+ 
++// This test writes raw mapped Metal bytes rather than issuing D3D writes.
++// Complete D3DMetal's queued resource initialization before those CPU writes;
++// ReleaseSync now correctly submits/waits for GPU work instead of hiding it.
++bool finish_initialization(ID3D11Device* dev) {
++    Com<ID3D11DeviceContext> ctx;
++    dev->GetImmediateContext(&ctx);
++    D3D11_QUERY_DESC desc{D3D11_QUERY_EVENT, 0};
++    Com<ID3D11Query> done;
++    if (FAILED(dev->CreateQuery(&desc, &done))) return false;
++    ctx->End(done.ptr());
++    ctx->Flush();
++    const uint64_t deadline = now_ms() + 5000;
++    BOOL complete = FALSE;
++    while (!complete) {
++        if (FAILED(ctx->GetData(done.ptr(), &complete, sizeof(complete), 0)) ||
++            now_ms() >= deadline) return false;
++        if (!complete) usleep(1000);
++    }
++    return true;
++}
++
+ int producer(int sock) {
+     Com<ID3D11Device> dev = make_device();
+     if (!dev) { fprintf(stderr, "KMUTEX: prod device FAILED\n"); return 1; }
+@@ -92,6 +113,7 @@ int producer(int sock) {
+                 "not vended\n");
+         return 1;
+     }
++    if (!finish_initialization(dev.ptr())) return 1;
+     dmn_shared_texture_handle pod;
+     memcpy(&pod, h, sizeof(pod));
+     if (!send_with_fd(sock, &pod, sizeof(pod), pod.fd)) {
+@@ -146,6 +168,7 @@ int consumer(int sock) {
+     if (FAILED(tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&km)) || !km) {
+         fprintf(stderr, "KMUTEX: cons QI(IDXGIKeyedMutex) FAILED\n"); return 1;
+     }
++    if (!finish_initialization(dev.ptr())) return 1;
+     volatile uint32_t* counter = map_counter(pod.fd, pod.stride * kH);
+     if (!counter) { fprintf(stderr, "KMUTEX: cons map FAILED\n"); return 1; }
+ 
+diff --git a/tests/meson.build b/tests/meson.build
+index 727e13a..6325bcf 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -19,6 +19,12 @@ abi_check = executable('abi-check-test', 'abi_check_test.cpp',
+   include_directories: [test_native_inc, include_directories('../src')])
+ test('abi-check', abi_check, timeout: 30)
+ 
++metal_cube_view = executable('metal-cube-view-test', 'metal_cube_view_test.mm',
++  include_directories: [include_directories('../src'), include_directories('../include')],
++  link_with: dmn_lib,
++  dependencies: [cocoa_deps])
++test('metal-cube-view', metal_cube_view, env: ['DMN_LOG=info'], timeout: 30)
++
+ # The COM invariants every registry in the library keys on: identity resolved
+ # through a DXGI view must match the resource's and cost no references, and a
+ # shared resource must die when the app drops it. Needs ../src for the library's
+@@ -179,6 +185,15 @@ d3d11_sharedbuf = executable('d3d11-sharedbuf-test',
+   link_with: dmn_lib)
+ test('d3d11-sharedbuf', d3d11_sharedbuf, env: ['DMN_LOG=info'], timeout: 300)
+ 
++steamvr_constant_buffer = executable('steamvr-constant-buffer-test',
++  'steamvr_constant_buffer_test.cpp',
++  include_directories: test_native_inc,
++  link_with: dmn_lib)
++test('steamvr-constant-buffer', steamvr_constant_buffer,
++  env: ['DMN_LOG=info'], is_parallel: false, timeout: 60)
++test('steamvr-wine-handles', steamvr_constant_buffer,
++  env: ['DMN_LOG=info', 'DMN_WINE_SHARING=1'], is_parallel: false, timeout: 60)
++
+ # Windowless: D3D12 producer fence (queue Signal -> helper-queue Wait +
+ # WriteBufferImmediate) read back by the raw consumer and an imported ID3D12Fence.
+ d3d12_fence = executable('d3d12-fence-test',
+@@ -227,6 +242,17 @@ test('shared-srv-sample', shared_srv_sample_test, env: ['DMN_LOG=info'], timeout
+ test('shared-srv-sample-no-residency-set', shared_srv_sample_test,
+      env: ['DMN_LOG=info', 'DMN_RESIDENCY_SET=0'], timeout: 300)
+ 
++# The original producer must not erase a peer's writes on its first GPU use.
++shared_producer_sample = executable('shared-producer-sample-test',
++  'shared_producer_sample_test.cpp',
++  include_directories: test_native_inc,
++  link_with: dmn_lib)
++test('shared-producer-sample-first', shared_producer_sample,
++     env: ['DMN_LOG=info'], is_parallel: false, timeout: 60)
++test('shared-producer-blit-first', shared_producer_sample,
++     env: ['DMN_LOG=info', 'PRODUCERSAMPLE_BLIT_FIRST=1'],
++     is_parallel: false, timeout: 60)
++
+ # A rejected call must leave nothing behind: no crash, no fds, no threads.
+ # Interception starts work before it knows the call will succeed, so this is
+ # where an un-unwound arm or watcher shows up.
+@@ -278,6 +304,15 @@ keyed_mutex = executable('keyed-mutex-test',
+ test('keyed-mutex', keyed_mutex, env: ['DMN_LOG=info'],
+      is_parallel: false, timeout: 300)
+ 
++# ReleaseSync must publish the key only after preceding GPU writes complete.
++# Producer Flush alone does not establish cross-process GPU ordering.
++keyed_mutex_gpu_order = executable('keyed-mutex-gpu-order-test',
++  'keyed_mutex_gpu_order_test.cpp',
++  include_directories: test_native_inc,
++  link_with: dmn_lib)
++test('keyed-mutex-gpu-order', keyed_mutex_gpu_order, env: ['DMN_LOG=info'],
++     is_parallel: false, timeout: 60)
++
+ # Windowless: create -> open -> release-creator -> re-export (both APIs);
+ # the opened resource's registration must own its own fd (MSDN handle rule).
+ shared_reexport = executable('shared-reexport-test',
+diff --git a/src/dmn_wine_handles.cpp b/src/dmn_wine_handles.cpp
+new file mode 100644
+index 0000000..1f02009
+--- /dev/null
++++ b/src/dmn_wine_handles.cpp
+@@ -0,0 +1,302 @@
++#include "dmn_wine_handles.h"
++#include "dmn_log.h"
++#include <array>
++#include <atomic>
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <poll.h>
++#include <unistd.h>
++
++namespace {
++constexpr int32_t kFail = int32_t(0x80004005), kInvalid = int32_t(0x80070057);
++constexpr size_t kCapacity = 128;
++constexpr uint32_t kTag = 0x60000000, kMask = 0xf0000000;
++struct Owner { uint32_t version; int32_t pid; uint64_t cookie; };
++struct Packet { int32_t hr; uint32_t size; alignas(8) char pod[kCapacity]; };
++struct Entry {
++    void* identity;
++    Packet packet;
++    int fd;
++};
++
++std::string directory() {
++    const char* path = getenv("DMN_WINE_SOCKET_DIR");
++    if (!path || !*path) return {};
++    struct stat st{};
++    if (lstat(path, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
++        (st.st_mode & 077)) return {};
++    return path;
++}
++std::string token_path(const std::string& dir, uint32_t token) {
++    char leaf[32];
++    snprintf(leaf, sizeof(leaf), "/%08x.ref", token);
++    return dir + leaf;
++}
++std::string owner_path(const std::string& dir, const Owner& owner) {
++    char leaf[64];
++    snprintf(leaf, sizeof(leaf), "/p%d-%016llx.sock", owner.pid,
++             (unsigned long long)owner.cookie);
++    return dir + leaf;
++}
++bool address(const std::string& path, sockaddr_un& out) {
++    if (path.size() >= sizeof(out.sun_path)) return false;
++    out.sun_family = AF_UNIX;
++    out.sun_len = sizeof(out);
++    memcpy(out.sun_path, path.c_str(), path.size() + 1);
++    return true;
++}
++void socket_options(int fd) {
++    int flags = fcntl(fd, F_GETFL);
++    if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
++    int yes = 1;
++    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
++    timeval timeout{2, 0};
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
++}
++bool read_exact(int fd, void* dst, size_t size) {
++    char* p = static_cast<char*>(dst);
++    while (size) {
++        ssize_t n = read(fd, p, size);
++        if (n < 0 && errno == EINTR) continue;
++        if (n <= 0) return false;
++        p += n; size -= size_t(n);
++    }
++    return true;
++}
++bool write_exact(int fd, const void* src, size_t size) {
++    const char* p = static_cast<const char*>(src);
++    while (size) {
++        ssize_t n = write(fd, p, size);
++        if (n < 0 && errno == EINTR) continue;
++        if (n <= 0) return false;
++        p += n; size -= size_t(n);
++    }
++    return true;
++}
++
++class Broker {
++public:
++    std::mutex mutex;
++    std::unordered_map<uint32_t, Entry> entries;
++    std::unordered_map<void*, uint32_t> identities;
++    std::string dir, path;
++    Owner owner{};
++    int listener = -1;
++    std::thread worker;
++    std::atomic<bool> stopped{false};
++
++    bool start() {
++        dir = directory();
++        if (dir.empty()) return false;
++        owner = {1, getpid(), (uint64_t(arc4random()) << 32) | arc4random()};
++        path = owner_path(dir, owner);
++        sockaddr_un addr{};
++        if (!address(path, addr)) return false;
++        listener = socket(AF_UNIX, SOCK_STREAM, 0);
++        if (listener < 0) return false;
++        fcntl(listener, F_SETFD, FD_CLOEXEC);
++        if (bind(listener, (sockaddr*)&addr, sizeof(addr)) || listen(listener, 16)) {
++            close(listener); listener = -1; unlink(path.c_str()); return false;
++        }
++        fcntl(listener, F_SETFL, O_NONBLOCK);
++        worker = std::thread([this] { serve(); });
++        return true;
++    }
++    void serve() {
++        while (!stopped) {
++            pollfd ready{listener, POLLIN, 0};
++            int pending = poll(&ready, 1, 100);
++            if (pending == 0) continue;
++            if (pending < 0) {
++                if (errno == EINTR) continue;
++                break;
++            }
++            if (stopped) break;
++            int client = accept(listener, nullptr, nullptr);
++            if (client < 0) {
++                if (stopped) break;
++                if (errno == EINTR || errno == EAGAIN) continue;
++                break;
++            }
++            socket_options(client);
++            uint32_t token = 0;
++            Packet packet{kInvalid, 0, {}};
++            int exported = -1;
++            if (read_exact(client, &token, sizeof(token))) {
++                std::lock_guard<std::mutex> lock(mutex);
++                auto it = entries.find(token);
++                if (it != entries.end()) {
++                    packet = it->second.packet;
++                    exported = fcntl(it->second.fd, F_DUPFD_CLOEXEC, 0);
++                    if (exported < 0) packet = {kFail, 0, {}};
++                }
++            }
++            iovec io{&packet, sizeof(packet)};
++            alignas(cmsghdr) char ancillary[CMSG_SPACE(sizeof(int))]{};
++            msghdr msg{};
++            msg.msg_iov = &io; msg.msg_iovlen = 1;
++            if (exported >= 0) {
++                msg.msg_control = ancillary;
++                msg.msg_controllen = sizeof(ancillary);
++                cmsghdr* cm = CMSG_FIRSTHDR(&msg);
++                cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS;
++                cm->cmsg_len = CMSG_LEN(sizeof(int));
++                memcpy(CMSG_DATA(cm), &exported, sizeof(exported));
++            }
++            ssize_t n = sendmsg(client, &msg, 0);
++            if (n > 0 && size_t(n) < sizeof(packet))
++                write_exact(client, reinterpret_cast<char*>(&packet) + n,
++                            sizeof(packet) - size_t(n));
++            if (exported >= 0) close(exported);
++            close(client);
++        }
++    }
++    void stop() {
++        stopped = true;
++        if (worker.joinable()) worker.join();
++        if (listener >= 0) close(listener);
++        std::lock_guard<std::mutex> lock(mutex);
++        for (const auto& entry : entries) {
++            close(entry.second.fd);
++            unlink(token_path(dir, entry.first).c_str());
++        }
++        entries.clear(); identities.clear();
++        unlink(path.c_str());
++    }
++};
++std::atomic<Broker*> broker{nullptr};
++std::once_flag broker_once;
++void stop_broker() { if (auto* b = broker.load()) b->stop(); }
++Broker* get_broker() {
++    std::call_once(broker_once, [] {
++        auto* candidate = new Broker;
++        if (!candidate->start()) { delete candidate; return; }
++        broker.store(candidate);
++        std::atexit(stop_broker);
++    });
++    return broker.load();
++}
++}
++
++bool dmn_wine_handles_enabled() {
++    const char* enabled = getenv("DMN_WINE_SHARING");
++    return enabled && strcmp(enabled, "1") == 0;
++}
++bool dmn_wine_is_handle(void* handle) {
++    uintptr_t value = reinterpret_cast<uintptr_t>(handle);
++    return dmn_wine_handles_enabled() && value <= UINT32_MAX &&
++           (uint32_t(value) & kMask) == kTag;
++}
++int32_t dmn_wine_export_handle(void* identity, const void* pod, size_t size,
++                               void** handle) {
++    if (!pod || !handle || size < 12 || size > kCapacity) return kInvalid;
++    Broker* b = get_broker();
++    if (!b) return kFail;
++    std::lock_guard<std::mutex> lock(b->mutex);
++    auto previous = b->identities.find(identity);
++    if (previous != b->identities.end()) {
++        *handle = reinterpret_cast<void*>(uintptr_t(previous->second));
++        return 0;
++    }
++    int fd = -1;
++    memcpy(&fd, static_cast<const char*>(pod) + 8, sizeof(fd));
++    int owned = fcntl(fd, F_DUPFD_CLOEXEC, 0);
++    if (owned < 0) return kFail;
++    uint32_t token = 0;
++    int record = -1;
++    for (int attempt = 0; attempt < 64; ++attempt) {
++        token = kTag | (arc4random() & 0x0ffffffcu);
++        record = open(token_path(b->dir, token).c_str(),
++                      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
++        if (record >= 0) break;
++        if (errno != EEXIST) { close(owned); return kFail; }
++    }
++    if (record < 0) { close(owned); return kFail; }
++    bool ok = write_exact(record, &b->owner, sizeof(b->owner));
++    close(record);
++    if (!ok) {
++        unlink(token_path(b->dir, token).c_str()); close(owned); return kFail;
++    }
++    Entry entry{identity, {0, uint32_t(size), {}}, owned};
++    memcpy(entry.packet.pod, pod, size);
++    b->entries.emplace(token, entry);
++    b->identities.emplace(identity, token);
++    *handle = reinterpret_cast<void*>(uintptr_t(token));
++    DMN_INFO("wine: exported legacy token 0x%08x pid=%d", token, getpid());
++    return 0;
++}
++int32_t dmn_wine_import_handle(void* handle, void* pod, size_t capacity,
++                               size_t* size, int* fd) {
++    if (!dmn_wine_is_handle(handle) || !pod || !size || !fd) return kInvalid;
++    *fd = -1; *size = 0;
++    std::string dir = directory();
++    if (dir.empty()) return kFail;
++    uint32_t token = uint32_t(reinterpret_cast<uintptr_t>(handle));
++    int record = open(token_path(dir, token).c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    if (record < 0) return kInvalid;
++    Owner owner{};
++    struct stat st{};
++    bool ok = fstat(record, &st) == 0 && S_ISREG(st.st_mode) &&
++              st.st_uid == geteuid() && st.st_size == sizeof(owner) &&
++              read_exact(record, &owner, sizeof(owner));
++    close(record);
++    if (!ok || owner.version != 1 || owner.pid <= 0) return kInvalid;
++    sockaddr_un addr{};
++    if (!address(owner_path(dir, owner), addr)) return kFail;
++    int client = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (client < 0) return kFail;
++    socket_options(client);
++    if (connect(client, (sockaddr*)&addr, sizeof(addr)) ||
++        !write_exact(client, &token, sizeof(token))) { close(client); return kInvalid; }
++    Packet packet{};
++    iovec io{&packet, sizeof(packet)};
++    alignas(cmsghdr) char ancillary[CMSG_SPACE(sizeof(int))]{};
++    msghdr msg{};
++    msg.msg_iov = &io; msg.msg_iovlen = 1;
++    msg.msg_control = ancillary; msg.msg_controllen = sizeof(ancillary);
++    ssize_t got = recvmsg(client, &msg, MSG_WAITALL);
++    close(client);
++    int received = -1;
++    for (cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm))
++        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
++            cm->cmsg_len == CMSG_LEN(sizeof(int)))
++            memcpy(&received, CMSG_DATA(cm), sizeof(received));
++    if (got != sizeof(packet) || (msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) ||
++        packet.hr < 0 || packet.size < 12 || packet.size > capacity ||
++        packet.size > kCapacity || received < 0) {
++        if (received >= 0) close(received);
++        return got == sizeof(packet) && packet.hr < 0 ? packet.hr : kFail;
++    }
++    fcntl(received, F_SETFD, FD_CLOEXEC);
++    memcpy(pod, packet.pod, packet.size);
++    memcpy(static_cast<char*>(pod) + 8, &received, sizeof(received));
++    *size = packet.size; *fd = received;
++    DMN_INFO("wine: imported legacy token 0x%08x pid=%d fd=%d", token, getpid(), received);
++    return 0;
++}
++void dmn_wine_evict_handle(void* identity) {
++    Broker* b = broker.load();
++    if (!b) return;
++    std::lock_guard<std::mutex> lock(b->mutex);
++    auto it = b->identities.find(identity);
++    if (it == b->identities.end()) return;
++    uint32_t token = it->second;
++    auto entry = b->entries.find(token);
++    if (entry != b->entries.end()) {
++        close(entry->second.fd);
++        b->entries.erase(entry);
++    }
++    unlink(token_path(b->dir, token).c_str());
++    b->identities.erase(it);
++}
+diff --git a/src/dmn_wine_handles.h b/src/dmn_wine_handles.h
+new file mode 100644
+index 0000000..58a75c4
+--- /dev/null
++++ b/src/dmn_wine_handles.h
+@@ -0,0 +1,14 @@
++/* Experimental legacy DXGI handles for Wine: an opaque 32-bit token, resolved
++ * by a per-process Unix-socket broker. NT handles are intentionally untouched.
++ * The private socket directory must be shared by the participating processes. */
++#pragma once
++#include <cstddef>
++#include <cstdint>
++
++bool dmn_wine_handles_enabled();
++bool dmn_wine_is_handle(void* handle);
++int32_t dmn_wine_export_handle(void* identity, const void* pod, size_t size,
++                               void** handle);
++int32_t dmn_wine_import_handle(void* handle, void* pod, size_t capacity,
++                               size_t* size, int* fd);
++void dmn_wine_evict_handle(void* identity);
+diff --git a/tests/steamvr_constant_buffer_test.cpp b/tests/steamvr_constant_buffer_test.cpp
+new file mode 100644
+index 0000000..4bf5bba
+--- /dev/null
++++ b/tests/steamvr_constant_buffer_test.cpp
+@@ -0,0 +1,173 @@
++/* Exact SteamVR frame-info shape: DEFAULT, CONSTANT_BUFFER, SHARED, 400 bytes.
++ * A fresh peer imports once, then GPU-reads every byte after each producer
++ * update. Socket acknowledgements deliberately serialize the two processes;
++ * this tests sharing, not SteamVR's GPU fence protocol. */
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <time.h>
++#include <unistd.h>
++#include <d3d11_4.h>
++#include <dxgi1_2.h>
++#include "d3dmetal_native.h"
++#include "common/com.h"
++#include "common/ipc.h"
++#define T_TAG "STEAMVR400"
++#include "common/check.h"
++
++namespace {
++constexpr unsigned kWords = 100, kTicks = 32;
++using Frame = std::array<uint32_t, kWords>;
++bool wine_handles() {
++    const char* mode = getenv("DMN_WINE_SHARING");
++    return mode && strcmp(mode, "1") == 0;
++}
++
++Frame frame(unsigned tick) {
++    Frame data{};
++    for (unsigned i = 0; i < data.size(); ++i)
++        data[i] = 0x46100000u ^ (tick * 0x10001u) ^ (i * 0x9e3779b9u);
++    return data;
++}
++
++uint64_t milliseconds() {
++    timespec t{};
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return uint64_t(t.tv_sec) * 1000 + uint64_t(t.tv_nsec) / 1000000;
++}
++
++int device(Com<ID3D11Device>& dev, Com<ID3D11DeviceContext>& ctx) {
++    EXPECT(dmn_init(nullptr) == DMN_SUCCESS, "dmn_init failed");
++    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0, actual;
++    CK(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
++                        &level, 1, D3D11_SDK_VERSION, &dev, &actual, &ctx),
++       "D3D11CreateDevice");
++    return 0;
++}
++
++int producer(int sock) {
++    Com<ID3D11Device> dev;
++    Com<ID3D11DeviceContext> ctx;
++    EXPECT(device(dev, ctx) == 0, "producer device failed");
++    D3D11_BUFFER_DESC desc{};
++    desc.ByteWidth = sizeof(Frame);
++    desc.Usage = D3D11_USAGE_DEFAULT;
++    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
++    Com<ID3D11Buffer> buffer;
++    CK_OK(dev->CreateBuffer(&desc, nullptr, &buffer), "CreateBuffer(400)");
++    Com<IDXGIResource> resource;
++    CK(buffer->QueryInterface(__uuidof(IDXGIResource), (void**)&resource), "QI");
++    HANDLE handle = nullptr;
++    CK_OK(resource->GetSharedHandle(&handle), "GetSharedHandle");
++    EXPECT(handle != nullptr, "empty shared handle");
++    if (wine_handles()) {
++        uintptr_t value = reinterpret_cast<uintptr_t>(handle);
++        EXPECT(value <= UINT32_MAX, "legacy handle cannot survive SteamVR truncation");
++        HANDLE again = nullptr;
++        CK(resource->GetSharedHandle(&again), "Repeated GetSharedHandle");
++        EXPECT(again == handle, "legacy handle identity changed");
++        uint32_t token = uint32_t(value);
++        EXPECT(write(sock, &token, sizeof(token)) == sizeof(token), "send token failed");
++    } else {
++        dmn_shared_buffer_handle wire{};
++        memcpy(&wire, handle, sizeof(wire));
++        EXPECT(wire.magic == DMN_SHARED_BUFFER_MAGIC && wire.size >= sizeof(Frame),
++               "bad shared buffer metadata");
++        EXPECT(send_with_fd(sock, &wire, sizeof(wire), wire.fd), "send fd failed");
++    }
++    char ack{};
++    EXPECT(read(sock, &ack, 1) == 1 && ack == 'R', "peer import failed");
++    D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
++    Com<ID3D11Query> done;
++    CK(dev->CreateQuery(&qd, &done), "CreateQuery");
++    for (unsigned tick = 1; tick <= kTicks; ++tick) {
++        Frame data = frame(tick);
++        ctx->UpdateSubresource(buffer.ptr(), 0, nullptr, data.data(), 0, 0);
++        ctx->End(done.ptr());
++        ctx->Flush();
++        BOOL complete = FALSE;
++        uint64_t deadline = milliseconds() + 5000;
++        while (!complete) {
++            HRESULT hr = ctx->GetData(done.ptr(), &complete, sizeof(complete), 0);
++            CK(hr, "GetData");
++            EXPECT(milliseconds() < deadline, "GPU completion timeout");
++            if (!complete) usleep(1000);
++        }
++        EXPECT(write(sock, &tick, sizeof(tick)) == sizeof(tick), "send tick failed");
++        EXPECT(read(sock, &ack, 1) == 1 && ack == 'A', "peer data check failed");
++    }
++    printf("STEAMVR400: producer pid=%d sent %u updates\n", getpid(), kTicks);
++    return 0;
++}
++
++int consumer(int sock) {
++    dmn_shared_buffer_handle wire{};
++    int fd = -1;
++    HANDLE handle = &wire;
++    if (wine_handles()) {
++        uint32_t token = 0;
++        EXPECT(read(sock, &token, sizeof(token)) == sizeof(token), "receive token failed");
++        handle = reinterpret_cast<HANDLE>(uintptr_t(token));
++    } else {
++        EXPECT(recv_with_fd(sock, &wire, sizeof(wire), &fd), "receive fd failed");
++        wire.fd = fd;
++    }
++    Com<ID3D11Device> dev;
++    Com<ID3D11DeviceContext> ctx;
++    EXPECT(device(dev, ctx) == 0, "consumer device failed");
++    Com<ID3D11Buffer> imported;
++    if (wine_handles()) {
++        Com<ID3D11Buffer> absent;
++        HRESULT hr = dev->OpenSharedResource((HANDLE)uintptr_t(0x6ffffffd),
++                                             __uuidof(ID3D11Buffer), (void**)&absent);
++        EXPECT(FAILED(hr) && !absent, "unknown token was accepted");
++    }
++    CK_OK(dev->OpenSharedResource(handle, __uuidof(ID3D11Buffer),
++                                 (void**)&imported), "OpenSharedResource");
++    if (fd >= 0) close(fd); // The import retains its own backing reference.
++    D3D11_BUFFER_DESC shape{};
++    imported->GetDesc(&shape);
++    EXPECT(shape.ByteWidth == sizeof(Frame), "import changed logical buffer size");
++    D3D11_BUFFER_DESC staging_desc{};
++    staging_desc.ByteWidth = sizeof(Frame);
++    staging_desc.Usage = D3D11_USAGE_STAGING;
++    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    Com<ID3D11Buffer> staging;
++    CK(dev->CreateBuffer(&staging_desc, nullptr, &staging), "Create staging");
++    char ack = 'R';
++    EXPECT(write(sock, &ack, 1) == 1, "send ready failed");
++    for (unsigned wanted = 1; wanted <= kTicks; ++wanted) {
++        unsigned tick = 0;
++        EXPECT(read(sock, &tick, sizeof(tick)) == sizeof(tick) && tick == wanted,
++               "receive tick failed");
++        ctx->CopyResource(staging.ptr(), imported.ptr());
++        D3D11_MAPPED_SUBRESOURCE map{};
++        CK(ctx->Map(staging.ptr(), 0, D3D11_MAP_READ, 0, &map), "Map staging");
++        Frame expected = frame(tick);
++        bool equal = memcmp(map.pData, expected.data(), sizeof(expected)) == 0;
++        ctx->Unmap(staging.ptr(), 0);
++        EXPECT(equal, "peer GPU readback differs from producer data");
++        ack = 'A';
++        EXPECT(write(sock, &ack, 1) == 1, "send acknowledgement failed");
++    }
++    printf("STEAMVR400: consumer pid=%d verified all 400 bytes in %u updates\n",
++           getpid(), kTicks);
++    return 0;
++}
++}
++
++int main(int argc, char** argv) {
++    if (argc == 3 && strcmp(argv[1], "--consumer") == 0)
++        return consumer(atoi(argv[2]));
++    if (wine_handles() && !getenv("DMN_WINE_SOCKET_DIR")) {
++        char dir[] = "/private/tmp/mvr-test-XXXXXX";
++        EXPECT(mkdtemp(dir) != nullptr, "temporary directory failed");
++        setenv("DMN_WINE_SOCKET_DIR", dir, 1);
++        std::atexit([] { rmdir(getenv("DMN_WINE_SOCKET_DIR")); });
++    }
++    int rc = run_exec_pair(T_TAG, argv[0], "--consumer", producer);
++    if (!rc) T_PASS();
++    return rc;
++}
+diff --git a/tests/metal_cube_view_test.mm b/tests/metal_cube_view_test.mm
+new file mode 100644
+index 0000000..ce68e38
+--- /dev/null
++++ b/tests/metal_cube_view_test.mm
+@@ -0,0 +1,63 @@
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#include <cstdio>
++#include <unistd.h>
++#include "dmn_share.h"
++
++static bool cube_view(id<MTLDevice> device, NSUInteger count, bool second) {
++    MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
++    desc.textureType = count == 1 ? MTLTextureTypeCube : MTLTextureTypeCubeArray;
++    desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
++    desc.width = desc.height = 16;
++    desc.arrayLength = count;
++    desc.mipmapLevelCount = 1;
++    desc.storageMode = MTLStorageModePrivate;
++    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++    id<MTLTexture> texture = [device newTextureWithDescriptor:desc];
++    [desc release];
++    if (!texture) return false;
++    MTLTextureSwizzleChannels swizzle = {
++        MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
++        MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha
++    };
++    id<MTLTexture> view = [texture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
++        textureType:second ? MTLTextureTypeCube : texture.textureType
++        levels:NSMakeRange(0, 1)
++        slices:NSMakeRange(second ? 6 : 0, second ? 6 : count * 6)
++        swizzle:swizzle];
++    bool ok = view && view.arrayLength == (second ? 1 : count);
++    [view release];
++    [texture release];
++    return ok;
++}
++
++int main() {
++    @autoreleasepool {
++        dmn_share_install_swizzles();
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        if (!device) return 2;
++        // Install the texture-class hooks via an actual shared impostor.
++        MTLTextureDescriptor* desc = [MTLTextureDescriptor
++            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
++            width:16 height:16 mipmapped:NO];
++        desc.storageMode = MTLStorageModeShared;
++        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++        dmn_share_arm_producer(0);
++        id<MTLTexture> shared = [device newTextureWithDescriptor:desc];
++        DmnShareArm arm{};
++        bool captured = dmn_share_disarm(&arm);
++        if (!shared || !captured) return 3;
++        if (arm.out_fd >= 0) close(arm.out_fd);
++        id<MTLTexture> shared_view = [shared newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
++            textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
++        if (!shared_view) return 4;
++        [shared_view release];
++        bool ok = cube_view(device, 1, false) && cube_view(device, 2, false)
++               && cube_view(device, 2, true);
++        [shared release];
++        [device release];
++        if (!ok) return 5;
++        puts("PASS: shared 2D view and ordinary cube/cube-array views preserve all faces");
++        return 0;
++    }
++}
+diff --git a/tests/keyed_mutex_gpu_order_test.cpp b/tests/keyed_mutex_gpu_order_test.cpp
+new file mode 100644
+index 0000000..f9a7246
+--- /dev/null
++++ b/tests/keyed_mutex_gpu_order_test.cpp
+@@ -0,0 +1,80 @@
++// Isolated keyed-mutex ordering probe, derived from MIT UTM shared_texture_test.
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <d3d11_4.h>
++#include <dxgi1_2.h>
++#include "d3dmetal_native.h"
++#include "common/com.h"
++#include "common/ipc.h"
++#define T_TAG "KEYEDGPU"
++#include "common/check.h"
++namespace {
++constexpr unsigned W=1664,H=928,TICKS=32;
++int device(Com<ID3D11Device>& d, Com<ID3D11DeviceContext>& c) {
++ EXPECT(dmn_init(nullptr)==DMN_SUCCESS,"init");
++ D3D_FEATURE_LEVEL level=D3D_FEATURE_LEVEL_11_0,actual;
++ CK(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,&level,1,D3D11_SDK_VERSION,&d,&actual,&c),"device");
++ return 0;
++}
++void colour(unsigned tick, float f[4], unsigned char b[4]) {
++ b[0]=(tick*43)%256;b[1]=(tick*79)%256;b[2]=(tick*131)%256;b[3]=255;
++ for(unsigned i=0;i<4;i++)f[i]=float(b[i])/255;
++}
++int producer(int sock) {
++ Com<ID3D11Device>d;Com<ID3D11DeviceContext>c;EXPECT(device(d,c)==0,"producer device");
++ D3D11_TEXTURE2D_DESC td{};td.Width=W;td.Height=H;td.MipLevels=1;td.ArraySize=1;
++ td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_DEFAULT;
++ td.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;td.MiscFlags=D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
++ Com<ID3D11Texture2D>tex;CK(d->CreateTexture2D(&td,nullptr,&tex),"shared texture");
++ Com<IDXGIResource>res;CK(tex->QueryInterface(__uuidof(IDXGIResource),(void**)&res),"resource");
++ HANDLE handle=nullptr;CK(res->GetSharedHandle(&handle),"export");
++ dmn_shared_texture_handle pod{};memcpy(&pod,handle,sizeof(pod));
++ Com<IDXGIKeyedMutex>km;CK(tex->QueryInterface(__uuidof(IDXGIKeyedMutex),(void**)&km),"producer mutex");
++ Com<ID3D11RenderTargetView>rt;CK(d->CreateRenderTargetView(tex.ptr(),nullptr,&rt),"rtv");
++ EXPECT(send_with_fd(sock,&pod,sizeof(pod),pod.fd),"send allocation");
++ char ack=0;EXPECT(read(sock,&ack,1)==1,"consumer ready");
++ for(unsigned tick=1;tick<=TICKS;tick++) {
++  CK_OK(km->AcquireSync(0,5000),"producer acquire");
++  float f[4];unsigned char bytes[4];colour(tick,f,bytes);
++  c->ClearRenderTargetView(rt.ptr(),f);
++  c->Flush(); // Shared writes must Flush; deliberately no precompletion fence.
++  CK_OK(km->ReleaseSync(tick),"producer release");
++  EXPECT(write(sock,&tick,sizeof(tick))==sizeof(tick),"announce tick");
++  EXPECT(read(sock,&ack,1)==1,"consumer ack");
++ }
++ return 0;
++}
++int consumer(int sock) {
++ dmn_shared_texture_handle pod{};int fd=-1;EXPECT(recv_with_fd(sock,&pod,sizeof(pod),&fd),"receive");pod.fd=fd;
++ Com<ID3D11Device>d;Com<ID3D11DeviceContext>c;EXPECT(device(d,c)==0,"consumer device");
++ Com<ID3D11Texture2D>tex;CK(d->OpenSharedResource(&pod,__uuidof(ID3D11Texture2D),(void**)&tex),"import");
++ Com<IDXGIKeyedMutex>km;CK(tex->QueryInterface(__uuidof(IDXGIKeyedMutex),(void**)&km),"consumer mutex");
++ D3D11_TEXTURE2D_DESC td{};tex->GetDesc(&td);td.Usage=D3D11_USAGE_STAGING;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;td.BindFlags=td.MiscFlags=0;
++ Com<ID3D11Texture2D>staging;CK(d->CreateTexture2D(&td,nullptr,&staging),"staging");
++ const size_t mapsize=(pod.size+16383)&~size_t(16383);const unsigned char*cpu=(const unsigned char*)mmap(nullptr,mapsize,PROT_READ,MAP_SHARED,fd,0);EXPECT(cpu!=MAP_FAILED,"CPU map");
++ const size_t at=(H/2)*pod.stride+(W/2)*4;unsigned cpuBad=0,gpuBad=0;
++ char ack='R';EXPECT(write(sock,&ack,1)==1,"ready");
++ for(unsigned want=1;want<=TICKS;want++) {
++  unsigned tick=0;EXPECT(read(sock,&tick,sizeof(tick))==sizeof(tick)&&tick==want,"tick");
++  CK_OK(km->AcquireSync(tick,5000),"consumer acquire");
++  float f[4];unsigned char bytes[4],early[4];colour(tick,f,bytes);memcpy(early,cpu+at,4);
++  bool earlymatch=memcmp(early,bytes,4)==0;if(!earlymatch)cpuBad++;
++  c->CopyResource(staging.ptr(),tex.ptr());
++  D3D11_MAPPED_SUBRESOURCE mapped{};CK(c->Map(staging.ptr(),0,D3D11_MAP_READ,0,&mapped),"readback");
++  unsigned char got[4];memcpy(got,(unsigned char*)mapped.pData+(H/2)*mapped.RowPitch+(W/2)*4,4);
++  c->Unmap(staging.ptr(),0);bool match=memcmp(got,bytes,4)==0;if(!match)gpuBad++;
++  printf(T_TAG ": tick=%u expected=%02x%02x%02x%02x cpuEarly=%02x%02x%02x%02x GPU=%02x%02x%02x%02x %s\n",tick,bytes[0],bytes[1],bytes[2],bytes[3],early[0],early[1],early[2],early[3],got[0],got[1],got[2],got[3],match?"OK":"MISMATCH");
++  CK_OK(km->ReleaseSync(0),"consumer release");ack='A';EXPECT(write(sock,&ack,1)==1,"ack");
++ }
++ munmap((void*)cpu,mapsize);close(fd);
++ printf(T_TAG ": CPU early mismatches=%u/%u GPU readback mismatches=%u/%u\n",cpuBad,TICKS,gpuBad,TICKS);
++ EXPECT(gpuBad==0,"keyed mutex GPU ordering failed");T_PASS();return 0;
++}
++}
++int main(int argc,char**argv) {
++ if(argc==3&&strcmp(argv[1],"--consumer")==0)return consumer(atoi(argv[2]));
++ return run_exec_pair(T_TAG,argv[0],"--consumer",producer);
++}
+diff --git a/tests/shared_producer_sample_test.cpp b/tests/shared_producer_sample_test.cpp
+new file mode 100644
+index 0000000..cfe1215
+--- /dev/null
++++ b/tests/shared_producer_sample_test.cpp
+@@ -0,0 +1,224 @@
++/* MIT-derived regression: creator makes an undefined shared texture, peer
++ * fills the imported view and completes GPU work, creator's FIRST GPU use
++ * must preserve and sample those bytes. A late creator zero-fill used to erase
++ * the peer's complete image. Separate fresh runs sample first or blit first.
++ */
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++#include <sys/mman.h>
++#include <d3d11_4.h>
++#include <dxgi1_2.h>
++#include <d3dcompiler.h>
++#include <windows.h>
++
++#include "d3dmetal_native.h"
++#include "common/com.h"
++
++#define T_TAG "SHAREDPRODUCER"
++#include "common/check.h"
++#include "common/skip.h"
++#include "common/ipc.h"
++
++namespace {
++
++constexpr uint32_t kW = 256, kH = 256;
++
++/* Per-texel gradient (RGBA8): B = x scaled, G = y scaled, R = (x+y) scaled.
++ * A flat/box sample zeroes the colour channels, which this catches. */
++void gradient_texel(uint32_t x, uint32_t y, uint8_t out[4]) {
++    out[0] = (uint8_t)(x * 255 / (kW - 1));        /* R */
++    out[1] = (uint8_t)(y * 255 / (kH - 1));        /* G */
++    out[2] = (uint8_t)((x + y) * 255 / (kW + kH)); /* B */
++    out[3] = 0xff;                                 /* A */
++}
++
++const char* kVS =
++    "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
++    "VSOut main(uint vid : SV_VertexID) {\n"
++    "    VSOut o;\n"
++    "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
++    "    o.uv = p;\n"
++    "    o.pos = float4(p * 2.0 - 1.0, 0, 1);\n"
++    "    o.pos.y = -o.pos.y;\n"
++    "    return o;\n"
++    "}\n";
++
++/* Normalised-coordinate sample (the natural D2D/DWM path); this is the access
++ * that flattens for a 2D-as-array binding. */
++const char* kPS =
++    "Texture2D tex : register(t0);\n"
++    "SamplerState smp : register(s0);\n"
++    "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
++    "    return tex.Sample(smp, uv);\n"
++    "}\n";
++
++HRESULT make_device(Com<ID3D11Device>& dev, Com<ID3D11DeviceContext>& ctx) {
++    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_1, flo;
++    return D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
++                             D3D11_CREATE_DEVICE_BGRA_SUPPORT, &fl, 1,
++                             D3D11_SDK_VERSION, &dev, &flo, &ctx);
++}
++
++/* CopyResource a texture into a fresh CPU-readable staging copy and read texel
++ * (x,y). Also forces the source GPU work to complete (Map blocks). */
++int read_texel(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* src,
++               uint32_t x, uint32_t y, uint8_t out[4]) {
++    D3D11_TEXTURE2D_DESC d = {};
++    src->GetDesc(&d);
++    d.BindFlags = 0;
++    d.MiscFlags = 0;
++    d.Usage = D3D11_USAGE_STAGING;
++    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    Com<ID3D11Texture2D> staging;
++    if (FAILED(dev->CreateTexture2D(&d, nullptr, &staging)))
++        return 1;
++    ctx->CopyResource(staging.ptr(), src);
++    ctx->Flush();
++    D3D11_MAPPED_SUBRESOURCE m = {};
++    if (FAILED(ctx->Map(staging.ptr(), 0, D3D11_MAP_READ, 0, &m)))
++        return 1;
++    const uint8_t* p = (const uint8_t*)m.pData + (size_t)y * m.RowPitch + (size_t)x * 4;
++    memcpy(out, p, 4);
++    ctx->Unmap(staging.ptr(), 0);
++    return 0;
++}
++
++int producer(int sock) {
++    EXPECT(dmn_init(nullptr) == DMN_SUCCESS, "producer init");
++    T_SKIP_WITHOUT("D3DCompile");
++    Com<ID3D11Device> cdev; Com<ID3D11DeviceContext> cctx;
++    CK(make_device(cdev,cctx), "owner device");
++    D3D11_TEXTURE2D_DESC td{};
++    td.Width=kW;td.Height=kH;td.MipLevels=1;td.ArraySize=1;
++    td.Format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;td.SampleDesc.Count=1;
++    td.Usage=D3D11_USAGE_DEFAULT;td.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;td.MiscFlags=D3D11_RESOURCE_MISC_SHARED;
++    // No local upload, clear or rendering of the original producer texture.
++    Com<ID3D11Texture2D> opened;
++    CK(cdev->CreateTexture2D(&td,nullptr,&opened), "owner original texture");
++    Com<IDXGIResource> resource; CK(opened->QueryInterface(__uuidof(IDXGIResource),(void**)&resource), "owner resource");
++    HANDLE handle=nullptr; CK(resource->GetSharedHandle(&handle), "owner export");
++    dmn_shared_texture_handle wire{};memcpy(&wire,handle,sizeof(wire));
++    EXPECT(send_with_fd(sock,&wire,sizeof(wire),wire.fd), "send allocation");
++    char ready=0;EXPECT(read(sock,&ready,1)==1 && ready=='R', "child fill completed");
++    uint8_t want[4];gradient_texel(kW*3/4,kH/4,want);
++    const size_t mapped_length=(wire.size+16383)&~size_t(16383);
++    const auto* cpu=static_cast<const uint8_t*>(mmap(nullptr,mapped_length,PROT_READ,MAP_SHARED,wire.fd,0));
++    EXPECT(cpu!=MAP_FAILED,"owner CPU backing");
++    const size_t pixel=(kH/4)*wire.stride+(kW*3/4)*4;
++    printf(T_TAG ": CPU before owner GPU read=%02x%02x%02x%02x expected=%02x%02x%02x%02x\n",cpu[pixel],cpu[pixel+1],cpu[pixel+2],cpu[pixel+3],want[0],want[1],want[2],want[3]);
++    EXPECT(memcmp(cpu+pixel,want,4)==0,"peer data missing before owner read");
++    const bool blit_first=getenv("PRODUCERSAMPLE_BLIT_FIRST")!=nullptr;
++    printf(T_TAG ": order=%s\n",blit_first ? "blit before sample" : "sample before blit");
++    if(blit_first) {
++    /* Control: blit readback of the opened surface — the always-correct path. */
++    uint8_t bc[4];
++    EXPECT(read_texel(cdev.ptr(), cctx.ptr(), opened.ptr(), kW * 3 / 4, kH / 4, bc) == 0,
++           "blit readback failed");
++    printf(T_TAG ": blit  readback RGBA=%02x%02x%02x%02x (expect %02x%02x%02x%02x)\n",
++           bc[0], bc[1], bc[2], bc[3], want[0], want[1], want[2], want[3]);
++    printf(T_TAG ": CPU after owner blit=%02x%02x%02x%02x\n",cpu[pixel],cpu[pixel+1],cpu[pixel+2],cpu[pixel+3]);
++    EXPECT(memcmp(cpu+pixel,want,4)==0,"owner blit erased peer data");
++    EXPECT(bc[0] == want[0] && bc[1] == want[1] && bc[2] == want[2],
++           "blit readback did not match gradient (producer/copy path broken)");
++
++    }
++    /* Sample the opened SRV through a pixel shader into a private RT. */
++    Com<ID3D11ShaderResourceView> srv;
++    CK(cdev->CreateShaderResourceView(opened.ptr(), nullptr, &srv), "CreateSRV");
++
++    D3D11_TEXTURE2D_DESC rd = td;
++    rd.BindFlags = D3D11_BIND_RENDER_TARGET;
++    rd.MiscFlags = 0;
++    Com<ID3D11Texture2D> rt;
++    CK(cdev->CreateTexture2D(&rd, nullptr, &rt), "CreateTexture2D(rt)");
++    Com<ID3D11RenderTargetView> rtv;
++    CK(cdev->CreateRenderTargetView(rt.ptr(), nullptr, &rtv), "CreateRTV");
++
++    Com<ID3DBlob> vsb, psb, errb;
++    CK(D3DCompile(kVS, strlen(kVS), "vs", nullptr, nullptr, "main", "vs_5_0", 0, 0,
++                  &vsb, &errb), "VS compile");
++    CK(D3DCompile(kPS, strlen(kPS), "ps", nullptr, nullptr, "main", "ps_5_0", 0, 0,
++                  &psb, &errb), "PS compile");
++    Com<ID3D11VertexShader> vs;
++    Com<ID3D11PixelShader> ps;
++    CK(cdev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr,
++                                &vs), "CreateVS");
++    CK(cdev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr,
++                               &ps), "CreatePS");
++    D3D11_SAMPLER_DESC smpd = {};
++    smpd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
++    smpd.AddressU = smpd.AddressV = smpd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
++    Com<ID3D11SamplerState> samp;
++    CK(cdev->CreateSamplerState(&smpd, &samp), "CreateSampler");
++
++    FLOAT clear[4] = {0, 0, 0, 1};
++    cctx->ClearRenderTargetView(rtv.ptr(), clear);
++    cctx->OMSetRenderTargets(1, &rtv, nullptr);
++    D3D11_VIEWPORT vp = {0, 0, (float)kW, (float)kH, 0, 1};
++    cctx->RSSetViewports(1, &vp);
++    cctx->IASetInputLayout(nullptr);
++    cctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    cctx->VSSetShader(vs.ptr(), nullptr, 0);
++    cctx->PSSetShader(ps.ptr(), nullptr, 0);
++    ID3D11ShaderResourceView* srvs[] = {srv.ptr()};
++    cctx->PSSetShaderResources(0, 1, srvs);
++    ID3D11SamplerState* samps[] = {samp.ptr()};
++    cctx->PSSetSamplers(0, 1, samps);
++    cctx->Draw(3, 0);
++    cctx->Flush();
++
++    /* Read the shaded texel that sampled source (48,16). */
++    uint8_t sc[4];
++    EXPECT(read_texel(cdev.ptr(), cctx.ptr(), rt.ptr(), kW * 3 / 4, kH / 4, sc) == 0,
++           "sampled readback failed");
++    printf(T_TAG ": shader sample RGBA=%02x%02x%02x%02x (expect %02x%02x%02x%02x)\n",
++           sc[0], sc[1], sc[2], sc[3], want[0], want[1], want[2], want[3]);
++
++    /* Tolerate filter/sRGB rounding; the bug returns flat zero colour (box). */
++    printf(T_TAG ": CPU after owner sample=%02x%02x%02x%02x\n",cpu[pixel],cpu[pixel+1],cpu[pixel+2],cpu[pixel+3]);
++    EXPECT(memcmp(cpu+pixel,want,4)==0,"owner shader sample erased peer data");
++    auto near = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) <= 8; };
++    EXPECT(near(sc[0], want[0]) && near(sc[1], want[1]) && near(sc[2], want[2]),
++           "shader-sampled shared SRV colour flattened (glyph-box regression)");
++
++    if(!blit_first) {
++    /* Control: blit readback of the opened surface — the always-correct path. */
++    uint8_t bc[4];
++    EXPECT(read_texel(cdev.ptr(), cctx.ptr(), opened.ptr(), kW * 3 / 4, kH / 4, bc) == 0,
++           "blit readback failed");
++    printf(T_TAG ": blit  readback RGBA=%02x%02x%02x%02x (expect %02x%02x%02x%02x)\n",
++           bc[0], bc[1], bc[2], bc[3], want[0], want[1], want[2], want[3]);
++    printf(T_TAG ": CPU after owner blit=%02x%02x%02x%02x\n",cpu[pixel],cpu[pixel+1],cpu[pixel+2],cpu[pixel+3]);
++    EXPECT(memcmp(cpu+pixel,want,4)==0,"owner blit erased peer data");
++    EXPECT(bc[0] == want[0] && bc[1] == want[1] && bc[2] == want[2],
++           "blit readback did not match gradient (producer/copy path broken)");
++
++    }
++    char done='D';EXPECT(write(sock,&done,1)==1,"owner finished");
++    munmap(const_cast<uint8_t*>(cpu),mapped_length);
++    T_PASS(); return 0;
++}
++int consumer(int sock) {
++    EXPECT(dmn_init(nullptr)==DMN_SUCCESS,"child init");
++    dmn_shared_texture_handle wire{};int received=-1;EXPECT(recv_with_fd(sock,&wire,sizeof(wire),&received),"receive allocation");wire.fd=received;
++    Com<ID3D11Device> dev;Com<ID3D11DeviceContext> ctx;CK(make_device(dev,ctx),"child device");
++    Com<ID3D11Texture2D> tex;CK(dev->OpenSharedResource(&wire,__uuidof(ID3D11Texture2D),(void**)&tex),"child import");
++    D3D11_TEXTURE2D_DESC td{};tex->GetDesc(&td);td.Usage=D3D11_USAGE_STAGING;td.BindFlags=td.MiscFlags=0;td.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
++    Com<ID3D11Texture2D> upload;CK(dev->CreateTexture2D(&td,nullptr,&upload),"child upload");
++    D3D11_MAPPED_SUBRESOURCE mapped{};CK(ctx->Map(upload.ptr(),0,D3D11_MAP_WRITE,0,&mapped),"child fill map");
++    for(uint32_t y=0;y<kH;y++)for(uint32_t x=0;x<kW;x++)gradient_texel(x,y,(uint8_t*)mapped.pData+y*mapped.RowPitch+x*4);
++    ctx->Unmap(upload.ptr(),0);ctx->CopyResource(tex.ptr(),upload.ptr());
++    uint8_t got[4],want[4];gradient_texel(kW*3/4,kH/4,want);
++    EXPECT(read_texel(dev.ptr(),ctx.ptr(),tex.ptr(),kW*3/4,kH/4,got)==0,"child completion readback");
++    EXPECT(memcmp(got,want,4)==0,"child gradient mismatch");
++    char ready='R';EXPECT(write(sock,&ready,1)==1,"child ready");
++    char done=0;EXPECT(read(sock,&done,1)==1&&done=='D',"owner acknowledgment");close(received);return 0;
++}
++} // namespace
++int main(int argc,char**argv) {
++    if(argc==3&&strcmp(argv[1],"--consumer")==0)return consumer(atoi(argv[2]));
++    return run_exec_pair(T_TAG,argv[0],"--consumer",producer);
++}

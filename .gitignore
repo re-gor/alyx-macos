@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+.build/
+.cache/
+.local/
+*.dylib
+*.exe
+*.dll
+*.apk
+*.zip
+*.tar.xz
+*.log
+*.sav
+*.h264
+.env

@@ -1,0 +1,303 @@
+/*
+ * Event-driven fence paths, windowless, single process:
+ *
+ *  1. SetEventOnCompletion + dmn_event_wait on the producer fence and on an
+ *     imported fence (the slot watchers must release waiters for values that
+ *     only ever arrive cross-fence).
+ *  2. CPU Signal visibility both directions: a CPU signal on the producer is
+ *     seen through the import, and a CPU signal on the import is seen through
+ *     the producer (Windows: CPU signals are immediately visible).
+ *  3. ID3D12Device1::SetEventOnMultipleFenceCompletion with an imported fence
+ *     in the mix, ALL and ANY flavors, against the native multi-wait.
+ *  4. Cross-API in-process: the same producer opened as an ID3D11Fence via
+ *     OpenSharedFence, waited with SetEventOnCompletion.
+ *  5. dmn_event_dup_fd: a pollable fd dup'd before the GPU signal becomes
+ *     readable when D3DMetal's internal SetEvent fires on fence completion.
+ *  6. dmn_event_dup_fd through SetEventOnMultipleFenceCompletion: the same
+ *     pollable-fd contract as (5), but via the multi-fence API. At interface
+ *     version 3 D3DMetal DUPLICATES the event and fires its async SetEvent on
+ *     the duplicate; the pollable fd (a cross-process pipe, unlike the in-proc
+ *     kqueue wait of (3)) must still become readable. Regression guard: the
+ *     duplicate has to carry the same exported pipe as the original.
+ *  7. The event is closed by its owner as soon as D3DMetal's completion fires,
+ *     while this library's slot watcher for the same registration is still
+ *     pending: the watcher must own its own handle onto the event.
+ *
+ * Prints "FEVENTS: PASS" and exits 0 on success.
+ */
+
+#include <cstdint>
+#include <cstdio>
+
+#include <poll.h>
+#include <unistd.h>
+
+#include <d3d11_4.h>
+#include <d3d12.h>
+#include <windows.h>
+
+#include "d3dmetal_native.h"
+#include "common/com.h"
+
+#define T_TAG "FEVENTS"
+#include "common/check.h"
+#include "common/skip.h"
+#include "common/dx11.h"
+#include "common/dx12.h"
+
+static const uint64_t kLongNs  = 10ull * 1000 * 1000 * 1000; /* 10 s */
+
+int main() {
+    if (dmn_init(nullptr) != DMN_SUCCESS) {
+        fprintf(stderr, "FEVENTS: dmn_init FAILED\n");
+        return 1;
+    }
+
+    Com<ID3D12Device> dev;
+    CK(make_d3d12_device(dev), "D3D12CreateDevice");
+    Com<ID3D12CommandQueue> queue;
+    CK(make_d3d12_queue(dev.ptr(), queue), "CreateCommandQueue");
+
+    Com<ID3D12Fence> prod;
+    CK(dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence),
+                        (void**)&prod), "CreateFence(SHARED)");
+    HANDLE h = nullptr;
+    CK(dev->CreateSharedHandle(prod.ptr(), nullptr, 0, nullptr, &h),
+       "CreateSharedHandle");
+    Com<ID3D12Fence> imp;
+    CK(dev->OpenSharedHandle(h, __uuidof(ID3D12Fence), (void**)&imp),
+       "OpenSharedHandle");
+
+    uint64_t v = 0;
+    /* Cleared when this D3DMetal has no multi-fence wait (see step 3). */
+    bool have_multi_wait = true;
+
+    /* 1) Event waits released by the producer's GPU signal. */
+    {
+        void* evProd = dmn_event_create(0, 0);
+        void* evImp = dmn_event_create(0, 0);
+        EXPECT(evProd && evImp, "event create failed");
+        v++;
+        CK(prod->SetEventOnCompletion(v, evProd), "producer SetEventOnCompletion");
+        CK(imp->SetEventOnCompletion(v, evImp), "import SetEventOnCompletion");
+        EXPECT(dmn_event_wait(evImp, 50ull * 1000 * 1000) == DMN_WAIT_TIMEOUT,
+               "import event fired before any signal");
+        CK(queue->Signal(prod.ptr(), v), "queue Signal");
+        EXPECT(dmn_event_wait(evProd, kLongNs) == DMN_WAIT_SIGNALED,
+               "producer event did not fire");
+        EXPECT(dmn_event_wait(evImp, kLongNs) == DMN_WAIT_SIGNALED,
+               "import event did not fire");
+        dmn_event_close(evProd);
+        dmn_event_close(evImp);
+        printf("FEVENTS: event waits ok (value %llu)\n", (unsigned long long)v);
+    }
+
+    /* 2) CPU Signal visibility, both directions. */
+    {
+        v++;
+        CK(prod->Signal(v), "producer CPU Signal");
+        EXPECT(imp->GetCompletedValue() >= v,
+               "producer CPU signal invisible through the import");
+        v++;
+        CK(imp->Signal(v), "import CPU Signal");
+        EXPECT(prod->GetCompletedValue() >= v,
+               "import CPU signal invisible through the producer");
+        printf("FEVENTS: CPU signal visibility ok (value %llu)\n",
+               (unsigned long long)v);
+    }
+
+    /* 3) Multi-fence waits with an imported fence in the mix. */
+    {
+        Com<ID3D12Device1> dev1;
+        if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device1),
+                                          (void**)&dev1)) && dev1) {
+            Com<ID3D12Fence> plain;
+            CK(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                (void**)&plain), "CreateFence(plain)");
+            ID3D12Fence* fences[2] = {imp.ptr(), plain.ptr()};
+            const uint64_t vImp = v + 1, vPlain = 1;
+            UINT64 values[2] = {vImp, vPlain};
+
+            /* ALL: must hold until BOTH are signaled. */
+            void* evAll = dmn_event_create(0, 0);
+            EXPECT(evAll, "event create failed");
+            HRESULT mhr = dev1->SetEventOnMultipleFenceCompletion(
+                fences, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, evAll);
+            /* GPTk 2.1 and earlier do not implement it; the steps that need one
+             * stand down (the rest of the fence-event contract still holds). */
+            if (t_unimplemented(mhr)) {
+                printf("FEVENTS: SetEventOnMultipleFenceCompletion is not "
+                       "implemented by this D3DMetal; multi-wait skipped\n");
+                dmn_event_close(evAll);
+                have_multi_wait = false;
+                goto after_multi;
+            }
+            CK(mhr, "SetEventOnMultipleFenceCompletion(ALL)");
+            CK(queue->Signal(prod.ptr(), vImp), "queue Signal(shared)");
+            v = vImp;
+            EXPECT(dmn_event_wait(evAll, 200ull * 1000 * 1000) == DMN_WAIT_TIMEOUT,
+                   "ALL wait fired with one fence pending");
+            CK(queue->Signal(plain.ptr(), vPlain), "queue Signal(plain)");
+            EXPECT(dmn_event_wait(evAll, kLongNs) == DMN_WAIT_SIGNALED,
+                   "ALL wait did not fire");
+            dmn_event_close(evAll);
+
+            /* ANY: the imported fence alone must release it. */
+            void* evAny = dmn_event_create(0, 0);
+            EXPECT(evAny, "event create failed");
+            UINT64 values2[2] = {v + 1, vPlain + 1000};
+            CK(dev1->SetEventOnMultipleFenceCompletion(
+                   fences, values2, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY, evAny),
+               "SetEventOnMultipleFenceCompletion(ANY)");
+            CK(queue->Signal(prod.ptr(), v + 1), "queue Signal(shared)");
+            v++;
+            EXPECT(dmn_event_wait(evAny, kLongNs) == DMN_WAIT_SIGNALED,
+                   "ANY wait did not fire on the imported fence");
+            dmn_event_close(evAny);
+            printf("FEVENTS: multi-fence waits ok (value %llu)\n",
+                   (unsigned long long)v);
+        } else {
+            printf("FEVENTS: ID3D12Device1 unavailable; multi-wait skipped\n");
+            have_multi_wait = false;
+        }
+    }
+after_multi:
+
+    /* 4) Cross-API in-process: same POD opened as an ID3D11Fence. */
+    {
+        Com<ID3D11Device> d11;
+        Com<ID3D11DeviceContext> ctx;
+        CK(make_d3d11_device(d11, ctx), "D3D11CreateDevice");
+        Com<ID3D11Device5> d115;
+        CK(d11->QueryInterface(__uuidof(ID3D11Device5), (void**)&d115),
+           "ID3D11Device5");
+        /* An import is a real fence created on the opening device, so ask that
+         * device for one first: absent before GPTk 3.0, and asking directly
+         * keeps the import machinery out of a path it cannot complete. */
+        {
+            Com<ID3D11Fence> probe;
+            if (t_unimplemented(d115->CreateFence(0, D3D11_FENCE_FLAG_NONE,
+                                                  __uuidof(ID3D11Fence),
+                                                  (void**)&probe))) {
+                printf("FEVENTS: D3D11 fences are not implemented by this "
+                       "D3DMetal; cross-API import skipped\n");
+                goto after_xapi;
+            }
+        }
+        Com<ID3D11Fence> imp11;
+        CK(d115->OpenSharedFence(h, __uuidof(ID3D11Fence), (void**)&imp11),
+           "OpenSharedFence");
+        EXPECT(imp11->GetCompletedValue() >= v,
+               "D3D11 import behind the producer value");
+        void* ev11 = dmn_event_create(0, 0);
+        EXPECT(ev11, "event create failed");
+        v++;
+        CK(imp11->SetEventOnCompletion(v, ev11), "D3D11 SetEventOnCompletion");
+        CK(queue->Signal(prod.ptr(), v), "queue Signal");
+        EXPECT(dmn_event_wait(ev11, kLongNs) == DMN_WAIT_SIGNALED,
+               "D3D11 import event did not fire");
+        dmn_event_close(ev11);
+        printf("FEVENTS: cross-API import event ok (value %llu)\n",
+               (unsigned long long)v);
+    }
+after_xapi:
+
+    /* 5) Pollable event fd released by D3DMetal's SetEvent on completion.
+     *    Manual-reset, so the fd stays readable regardless of who looks
+     *    first. */
+    {
+        void* ev = dmn_event_create(1, 0);
+        EXPECT(ev, "event create failed");
+        int fd = dmn_event_dup_fd(ev);
+        EXPECT(fd >= 0, "dmn_event_dup_fd failed");
+        v++;
+        CK(prod->SetEventOnCompletion(v, ev), "SetEventOnCompletion");
+        struct pollfd pfd = {fd, POLLIN, 0};
+        EXPECT(poll(&pfd, 1, 0) == 0, "event fd readable before the signal");
+        CK(queue->Signal(prod.ptr(), v), "queue Signal");
+        pfd = {fd, POLLIN, 0};
+        EXPECT(poll(&pfd, 1, 10000) == 1 && (pfd.revents & POLLIN),
+               "event fd never became readable on fence completion");
+        EXPECT(dmn_event_wait(ev, 0) == DMN_WAIT_SIGNALED,
+               "event not signaled alongside the readable fd");
+        close(fd);
+        dmn_event_close(ev);
+        printf("FEVENTS: pollable event fd ok (value %llu)\n",
+               (unsigned long long)v);
+    }
+
+    /* 6) Pollable event fd armed through SetEventOnMultipleFenceCompletion.
+     *    Same contract as (5), but the multi-fence path (v3) signals a
+     *    DUPLICATE of the event rather than the original. The in-process
+     *    kqueue wait survives that (dup shares the kqueue), so this instead
+     *    watches the exported pollable fd, whose backing pipe must follow the
+     *    event across DuplicateEvent. Manual-reset so the fd latches. */
+    {
+        Com<ID3D12Device1> dev1;
+        if (have_multi_wait &&
+            SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device1),
+                                          (void**)&dev1)) && dev1) {
+            Com<ID3D12Fence> mf;
+            CK(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                (void**)&mf), "CreateFence(multi)");
+            void* ev = dmn_event_create(1, 0);
+            EXPECT(ev, "event create failed");
+            int fd = dmn_event_dup_fd(ev);
+            EXPECT(fd >= 0, "dmn_event_dup_fd failed");
+            ID3D12Fence* fences[1] = {mf.ptr()};
+            UINT64 values[1] = {1};
+            CK(dev1->SetEventOnMultipleFenceCompletion(
+                   fences, values, 1, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, ev),
+               "SetEventOnMultipleFenceCompletion(pollable)");
+            struct pollfd pfd = {fd, POLLIN, 0};
+            EXPECT(poll(&pfd, 1, 0) == 0, "event fd readable before the signal");
+            CK(queue->Signal(mf.ptr(), 1), "queue Signal(multi)");
+            pfd = {fd, POLLIN, 0};
+            EXPECT(poll(&pfd, 1, 10000) == 1 && (pfd.revents & POLLIN),
+                   "event fd never became readable on multi-fence completion "
+                   "(DuplicateEvent dropped the exported pipe)");
+            EXPECT(dmn_event_wait(ev, 0) == DMN_WAIT_SIGNALED,
+                   "event not signaled alongside the readable fd");
+            close(fd);
+            dmn_event_close(ev);
+            printf("FEVENTS: pollable fd via multi-fence ok\n");
+        } else {
+            printf("FEVENTS: ID3D12Device1 unavailable; pollable multi-wait "
+                   "skipped\n");
+        }
+    }
+
+    /* 7) The event's owner may close it the moment ANY registration on it
+     *    fires. D3DMetal's own completion fires first; the slot watcher this
+     *    library adds fires strictly later, so it must be holding its own
+     *    handle onto the event rather than the caller's. Repeated to give a
+     *    stale-handle signal every chance to hit freed state. */
+    {
+        for (int i = 0; i < 100; i++) {
+            void* ev = dmn_event_create(0, 0);
+            EXPECT(ev, "event create failed");
+            v++;
+            ID3D12Fence* f = (i & 1) ? imp.ptr() : prod.ptr();
+            CK(f->SetEventOnCompletion(v, ev), "SetEventOnCompletion(close-race)");
+            CK(queue->Signal(prod.ptr(), v), "queue Signal(close-race)");
+            EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED,
+                   "close-race event did not fire");
+            dmn_event_close(ev); /* watcher may not have signaled yet */
+        }
+        /* Let every pending watcher run against the closed handles. */
+        {
+            void* ev = dmn_event_create(1, 0);
+            v++;
+            CK(prod->SetEventOnCompletion(v, ev), "SetEventOnCompletion(drain)");
+            CK(queue->Signal(prod.ptr(), v), "queue Signal(drain)");
+            EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED, "drain event");
+            dmn_event_close(ev);
+        }
+        printf("FEVENTS: event closed right after completion, %d rounds ok\n", 100);
+    }
+
+    CK(dmn_shared_handle_close(h) == DMN_SUCCESS ? S_OK : E_FAIL,
+       "dmn_shared_handle_close");
+    T_PASS();
+    return 0;
+}

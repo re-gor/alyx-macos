@@ -1,0 +1,30 @@
+{
+  "current": {
+    "refresh_hz": 72,
+    "msaa": 2,
+    "render_eye": [
+      1632,
+      1632
+    ],
+    "bitrate_mbps": 300,
+    "pacing": false,
+    "packet_size": 16384,
+    "encoder_threads": 10,
+    "video_queue": 2,
+    "foveated_encoding": true
+  },
+  "performance90": {
+    "refresh_hz": 90,
+    "msaa": 2,
+    "render_eye": [
+      1632,
+      1632
+    ],
+    "bitrate_mbps": 300,
+    "pacing": false,
+    "packet_size": 16384,
+    "encoder_threads": 10,
+    "video_queue": 2,
+    "foveated_encoding": true
+  }
+}

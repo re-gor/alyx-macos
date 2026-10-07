@@ -1,0 +1,134 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ *
+ * Internal shared declarations. Plain C++ (safe for .cpp and .mm TUs);
+ * Objective-C types appear only as void* here.
+ */
+
+#pragma once
+
+#include <cstdint>
+#include <string>
+
+#include "d3dmetal_native.h"
+#include "dmn_log.h"
+
+/* == Framework API table (dmn_init.cpp) ================================= */
+
+/* D3DMetal's D3D/DXGI/D3DCompile exports use the Microsoft x64 calling
+ * convention (they are called directly from Wine PE code). GFXT_Initialize
+ * and the whole GFXT host interface are plain SysV. */
+#define DMN_MS_ABI __attribute__((ms_abi))
+
+class GFXTOSInterface;
+
+struct DmnFrameworkApi {
+    void    (*GFXT_Initialize)(GFXTOSInterface*);
+    int32_t (DMN_MS_ABI *D3D11CreateDevice)(void*, uint32_t, void*, uint32_t,
+                                 const uint32_t*, uint32_t, uint32_t,
+                                 void**, uint32_t*, void**);
+    int32_t (DMN_MS_ABI *D3D11CreateDeviceAndSwapChain)(void*, uint32_t, void*, uint32_t,
+                                             const uint32_t*, uint32_t, uint32_t,
+                                             const void*, void**, void**,
+                                             uint32_t*, void**);
+    int32_t (DMN_MS_ABI *CreateDXGIFactory)(const void*, void**);
+    int32_t (DMN_MS_ABI *CreateDXGIFactory1)(const void*, void**);
+    int32_t (DMN_MS_ABI *CreateDXGIFactory2)(uint32_t, const void*, void**);
+    int32_t (DMN_MS_ABI *D3D12CreateDevice)(void*, uint32_t, const void*, void**);
+    int32_t (DMN_MS_ABI *D3D12GetDebugInterface)(const void*, void**);
+    int32_t (DMN_MS_ABI *D3D12SerializeRootSignature)(const void*, uint32_t,
+                                                      void**, void**);
+    int32_t (DMN_MS_ABI *D3D12SerializeVersionedRootSignature)(const void*,
+                                                               void**, void**);
+    int32_t (DMN_MS_ABI *D3D12CreateRootSignatureDeserializer)(const void*, size_t,
+                                                               const void*, void**);
+    int32_t (DMN_MS_ABI *D3D12CreateVersionedRootSignatureDeserializer)(
+        const void*, size_t, const void*, void**);
+    int32_t (DMN_MS_ABI *D3D12EnableExperimentalFeatures)(uint32_t, const void*,
+                                                          void*, uint32_t*);
+    int32_t (DMN_MS_ABI *DXGIDeclareAdapterRemovalSupport)(void);
+    int32_t (DMN_MS_ABI *D3DCompile)(const void*, size_t, const char*, const void*, void*,
+                          const char*, const char*, uint32_t, uint32_t,
+                          void**, void**);
+    int32_t (DMN_MS_ABI *D3DCompileFromFile)(const void*, const void*, void*,
+                                  const char*, const char*, uint32_t, uint32_t,
+                                  void**, void**);
+    int32_t (DMN_MS_ABI *D3D10CreateBlob)(size_t, void**);
+
+    /* D3DMDevice::EnableWriteBufferImmediate — an exported static bool that
+     * gates ID3D12GraphicsCommandList2::WriteBufferImmediate. GPTk 3.0 and
+     * earlier initialise it to true; 4.0b1 zero-initialises it and fills it
+     * from the matched per-app profile, so it is FALSE for anything the
+     * profile table does not know — and the shared-fence value store, which
+     * is exactly a WriteBufferImmediate, silently does nothing.
+     * NULL if the symbol is absent. See dmn_force_write_buffer_immediate(). */
+    unsigned char* EnableWriteBufferImmediate;
+
+    /* D3DMDevice::UseInternalHeaps — new in GPTk 4.0b1 (absent before), an
+     * exported static bool that makes D3DMetal suballocate resources out of
+     * large internal Metal heaps: a 4 KiB D3D11 buffer becomes an offset into a
+     * 256 MiB MTLBuffer. The substitution mechanism replaces the ONE Metal
+     * allocation a D3D resource create makes, so a pooled create hands it the
+     * whole pool. NULL if the symbol is absent.
+     * See dmn_dedicated_metal_alloc_begin(). */
+    unsigned char* UseInternalHeaps;
+};
+
+extern DmnFrameworkApi g_dmn_api;
+
+/* Re-assert EnableWriteBufferImmediate after a device creation (the D3DMDevice
+ * constructor writes it from the profile, so it must be set afterwards, and
+ * again for every device). No-op when the symbol is absent or already set. */
+void dmn_force_write_buffer_immediate();
+
+/* Bracket an armed create so the Metal allocation it makes is dedicated to the
+ * resource rather than suballocated from one of D3DMetal's internal heaps —
+ * without which the substitution captures the shared pool. Reference-counted
+ * (concurrent armed creates on other threads overlap); a no-op when the
+ * framework has no such knob. Paired by the dmn_share_arm entry points and
+ * dmn_share_disarm. */
+void dmn_dedicated_metal_alloc_begin();
+void dmn_dedicated_metal_alloc_end();
+
+/* Absolute path of the loaded framework binary ("" before init). */
+const std::string& dmn_framework_binary_path();
+/* Directory containing the framework's bundled dylibs (Versions/A/Resources). */
+const std::string& dmn_framework_resources_dir();
+
+/* Lazy default init used by the exported D3D forwarders. */
+dmn_result dmn_ensure_init();
+
+/* == Window table (dmn_window.mm) ======================================== */
+
+struct DmnWindow; /* full definition in dmn_window_internal.h (ObjC++ only) */
+
+/* Decode + validate an HWND pseudo-handle; NULL if unknown/dead. */
+DmnWindow* dmn_window_lookup(void* hwnd);
+
+/* == Swapchain helpers (dmn_gfxt_swapchain.mm) =========================== */
+
+/* Create the shared fallback NSView ahead of time (main thread if possible,
+ * else dispatched); called once from dmn_init. */
+void dmn_swapchain_prepare_dummy_view();
+
+/* == Cross-process sharing hooks (dmn_com_hooks.cpp, dmn_share_metal.mm) == */
+
+extern "C" {
+/* Install the Metal device/heap swizzles (dmn_share_metal.mm). Must run before
+ * D3DMetal is dlopen'd. Idempotent. */
+void dmn_share_install_swizzles(void);
+/* Patch the shared-resource/fence vtables reachable from a freshly created
+ * device. No-ops when the object is null. */
+void dmn_hooks_after_d3d11_device(void* device);
+void dmn_hooks_after_d3d12_device(void* device);
+}
+
+/* == Registry backend (dmn_gfxt_registry.cpp) ============================ */
+
+bool dmn_registry_store_u32(uint32_t root, const char* subkey,
+                            const char* name, uint32_t value);
+bool dmn_registry_store_u64(uint32_t root, const char* subkey,
+                            const char* name, uint64_t value);
+bool dmn_registry_store_string(uint32_t root, const char* subkey,
+                               const char* name, const char* value);

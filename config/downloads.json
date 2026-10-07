@@ -1,0 +1,37 @@
+{
+  "wine": {
+    "version": "WS12WineSikarugir10.0_6",
+    "url": "https://github.com/Sikarugir-App/Engines/releases/download/v1.0/WS12WineSikarugir10.0_6.tar.xz",
+    "sha256": "9da7ee0cbf386522f3a9906943726d9c3c125dbbd9ab120e3cde80e88d6091b2"
+  },
+  "template": {
+    "version": "1.0.11",
+    "url": "https://github.com/Sikarugir-App/Wrapper/releases/download/v1.0/Template-1.0.11.tar.xz",
+    "sha256": "9fa15479e7ff6abd99c1d07be285fb95f41fc6991586502427152b1f7d6ccb8a"
+  },
+  "alvr": {
+    "version": "20.14.1",
+    "url": "https://github.com/alvr-org/ALVR/releases/download/v20.14.1/alvr_streamer_windows.zip",
+    "sha256": "6fbb85432822e9e3162d29b2919cd843bd9805262aef0c4797ffec7c57654a83"
+  },
+  "headset": {
+    "version": "20.14.1",
+    "url": "https://github.com/alvr-org/ALVR/releases/download/v20.14.1/alvr_client_android.apk",
+    "sha256": "be68feeb02665e3d69f1cdbcabf38ea4d15c42868a7ec6b5e698dbefee4e4e36"
+  },
+  "steam": {
+    "version": "vendor-current",
+    "url": "https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe",
+    "sha256": null
+  },
+  "vc-runtime": {
+    "version": "vendor-current-x64-v14",
+    "url": "https://aka.ms/vc14/vc_redist.x64.exe",
+    "sha256": null
+  },
+  "adb": {
+    "version": "vendor-current",
+    "url": "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
+    "sha256": null
+  }
+}

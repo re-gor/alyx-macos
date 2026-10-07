@@ -1,0 +1,139 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ *
+ * D3D-facing shared-fence implementation (producer and consumer sides).
+ * dmn_com_hooks.cpp owns WHERE these are called from (which vtable slots),
+ * this module owns WHAT they do, and the fence-value slot protocol itself
+ * (mapping, reads, waits) lives in dmn_fence.cpp.
+ *
+ * Producer: a real D3D fence plus a companion shared buffer holding a uint64
+ * value slot the GPU writes on each Signal (see dmn_fence_d3d.cpp for the
+ * per-API mechanism). Consumer: OpenShared* creates a REAL fence on the
+ * opening device and registers it as an import; the hooked fence/queue/context
+ * methods merge the shared slot into reads and arm watcher threads that raise
+ * the local fence (waits) or store into the slot (signal-back). Because the
+ * imported object is a real D3DMetal fence, unhooked fence-consuming entry
+ * points degrade to stale values instead of crashing.
+ *
+ * MS-ABI TU (built against the vendored DirectX headers), like the hooks.
+ */
+
+#pragma once
+
+#include <d3d11_4.h>
+#include <d3d12.h>
+
+#include "d3dmetal_native.h" /* the shared-handle PODs */
+
+/* == Producer side ======================================================== */
+/* Wrap a freshly created SHARED-flag fence: build the companion slot (and,
+ * for D3D12, the GPU write machinery) and register the fence. Returns false on
+ * failure (the fence then behaves like a plain unshared fence). */
+bool dmn_fd3d_producer_create_d3d11(ID3D11Fence* fence,
+                                    UINT64 initial, UINT flags);
+bool dmn_fd3d_producer_create_d3d12(ID3D12Device* dev, ID3D12Fence* fence,
+                                    UINT64 initial, UINT flags);
+
+/* Tear down producer or import state for a destroyed fence (identity =
+ * dmn_com_identity taken while it was alive). Releases the companion buffer /
+ * slot view and helper objects; the registered fence pointer is borrowed,
+ * never AddRef'd, precisely so destruction can be observed. Called by the
+ * hooks' eviction sentinel; no-op for unknown identities. */
+void dmn_fd3d_fence_destroy(void* identity);
+
+/* Fill `out` with the fence's shareable POD. False if the fence is neither a
+ * producer nor an import (re-export from an opened fence is allowed). */
+bool dmn_fd3d_export(IUnknown* fence, dmn_shared_fence_handle* out);
+
+/* Signal interception, called after a SUCCESSFUL orig Signal. A D3D12
+ * producer's slot store rides its helper queue; a D3D11 producer's, and every
+ * import's signal-back, waits for the fence's own completion of the value. */
+void dmn_fd3d_after_ctx_signal(ID3D11Fence* fence, UINT64 value);
+void dmn_fd3d_on_queue_signal(ID3D12Fence* fence, UINT64 value);
+
+/* Hold a reference to a fence that was just signalled until the GPU reaches the
+ * value, then drop it — the deferred destruction the D3D runtime owes a
+ * signalled fence.
+ *
+ * GPTk 4.0b1 does not do it: destroying an ID3D11Fence before the GPU has passed
+ * the value it was signalled to kills the Metal command queue outright
+ * ("ExecuteCL MTL3 completion error ... IOGPUCommandQueueErrorDomain Code=10"),
+ * after which the process is wedged in the kernel and unkillable. An app is
+ * entitled to Signal a fence and drop it immediately, so the reference has to
+ * come from somewhere; earlier versions hold it themselves and are unaffected.
+ *
+ * Completed entries are reaped on each call, so the list holds only signals the
+ * GPU has not caught up with. A D3D11 context batches, so a signal does not
+ * retire until something submits it: past a small bound the context is flushed
+ * (which the runtime may do on its own at any time) rather than holding every
+ * fence an app signalled without ever flushing. */
+void dmn_fd3d_keepalive_d3d11(ID3D11DeviceContext4* ctx,
+                              ID3D11Fence* fence, UINT64 value);
+void dmn_fd3d_keepalive_d3d12(ID3D12Fence* fence, UINT64 value);
+
+/* CPU ID3D12Fence::Signal interception (after a successful orig): Windows CPU
+ * signal is immediately visible cross-process, so raise the shared slot now.
+ * No-op for fences that are neither producers nor imports. */
+void dmn_fd3d_on_cpu_signal(IUnknown* fence, UINT64 value);
+
+/* Merge the shared-slot value into a producer's or import's completed value.
+ * Returns `from_fence` unchanged for foreign fences. */
+UINT64 dmn_fd3d_completed_merge(IUnknown* fence, UINT64 from_fence);
+
+/* SetEventOnCompletion companion: also release `event` when the shared slot
+ * reaches `value` (covers cross-process progress the local fence never
+ * sees). Returns false for foreign fences.
+ *
+ * Takes ownership of `event` on every path and closes it when done.  Pass a
+ * dmn_event_duplicate taken BEFORE the real SetEventOnCompletion registered
+ * the original handle: once any registration on the event fires, its owner
+ * may close the original, and this watcher signals strictly later than
+ * that. */
+bool dmn_fd3d_watch_slot(IUnknown* fence, UINT64 value, HANDLE event);
+
+/* == Consumer side ======================================================== */
+/* Import a received POD: create a REAL fence on the opening device (initial
+ * value = the slot's current merged value) and register it. Returns the +1
+ * fence in *out; the caller patches its class methods and attaches the
+ * eviction sentinel. */
+HRESULT dmn_fd3d_import_d3d12(ID3D12Device* dev,
+                              const dmn_shared_fence_handle* pod,
+                              ID3D12Fence** out);
+HRESULT dmn_fd3d_import_d3d11(ID3D11Device5* dev,
+                              const dmn_shared_fence_handle* pod,
+                              ID3D11Fence** out);
+
+/* Before a GPU wait on `fence` is enqueued (queue Wait, context Wait, or one
+ * entry of SetEventOnMultipleFenceCompletion): no-op unless the fence is an
+ * import, in which case a watcher raises the local fence once the shared slot
+ * reaches `value`, releasing the native wait. */
+void dmn_fd3d_before_queue_wait(ID3D12Fence* fence, UINT64 value);
+void dmn_fd3d_before_ctx_wait(ID3D11DeviceContext4* c, ID3D11Fence* fence,
+                              UINT64 value);
+
+/* == Provided by dmn_com_hooks.cpp ======================================== */
+/* Companion-buffer POD lookup for a resource that just went through the hooked
+ * shared-buffer create path (the fence module creates its companion buffers
+ * through the standard public APIs, so the hooks record them). */
+bool dmn_res_lookup_buffer_pod(IUnknown* res, dmn_shared_buffer_handle* out);
+
+/* Signal through the ORIGINAL (pre-patch) method. Watcher raises of an
+ * imported fence must not re-enter the Signal hooks: they are not app
+ * signals (no slot mirror wanted), and hook_f12_Signal taking the import
+ * lock the raiser already holds would self-deadlock. Falls back to the
+ * plain call when the vtable is unpatched. */
+HRESULT dmn_hooks_f12_signal_orig(ID3D12Fence* fence, UINT64 value);
+HRESULT dmn_hooks_ctx_signal_orig(ID3D11DeviceContext4* c, ID3D11Fence* fence,
+                                  UINT64 value);
+
+/* GetCompletedValue / SetEventOnCompletion through the ORIGINAL methods: the
+ * fence's OWN progress, without the shared-slot merge (or slot watcher) the
+ * hooked entry points add. Anything that must know the fence itself has
+ * reached a value — releasing it, or publishing that value to peers — asks
+ * here: the slot can hold V (a peer's signal-back, or a store racing ahead of
+ * the fence's own signal command) while the fence's signal is still queued. */
+UINT64 dmn_hooks_f11_completed_orig(ID3D11Fence* fence);
+UINT64 dmn_hooks_f12_completed_orig(ID3D12Fence* fence);
+HRESULT dmn_hooks_f11_seoc_orig(ID3D11Fence* fence, UINT64 value, HANDLE ev);
+HRESULT dmn_hooks_f12_seoc_orig(ID3D12Fence* fence, UINT64 value, HANDLE ev);

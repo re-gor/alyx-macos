@@ -1,0 +1,195 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ *
+ * Internal facade for cross-process resource sharing. Split cleanly so the
+ * COM-hook TU (dmn_com_hooks.cpp, plain C++ + DirectX headers, MS-ABI) never
+ * touches Metal, and the Metal TU (dmn_share_metal.mm, ObjC++/SysV) never
+ * touches the DirectX headers. They communicate only through the POD structs
+ * and plain-C entry points declared here.
+ *
+ * The "arm" mechanism: a producer/consumer COM thunk, just before it calls a
+ * D3DMetal create that will internally allocate a Metal texture, arms a
+ * thread-local record. The ObjC swizzle installed over the Metal device/heap
+ * classes sees the armed record on the very next texture creation, substitutes
+ * a shared-memory-backed linear texture, records what it built, and disarms.
+ */
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+/* Internal mirror of the public PODs (include/d3dmetal_native.h). Kept as a
+ * separate declaration so this header has no include-order dependency; the
+ * static_asserts in dmn_share_metal.mm check the layouts stay identical. */
+struct DmnShareTexPOD {
+    uint32_t magic, version;
+    int32_t  fd;
+    uint32_t width, height;
+    uint32_t dxgi_format;
+    uint32_t mip_levels, array_size, sample_count;
+    uint32_t bind_flags, misc_flags, cpu_access;
+    uint64_t stride;
+    uint64_t size;
+    uint64_t offset;
+};
+
+struct DmnShareFencePOD {
+    uint32_t magic, version;
+    int32_t  fd;
+    uint32_t flags;
+    uint64_t initial_value;
+};
+
+/* == Arm record (thread-local; set by hooks, consumed by the swizzle) ===== */
+
+enum DmnShareKind {
+    DMN_SHARE_TEXTURE = 0,
+    DMN_SHARE_BUFFER  = 1,  /* raw MTLBuffer (e.g. a GPU-written fence-value page) */
+};
+
+struct DmnShareArm {
+    bool     armed;
+    int      kind;          /* DmnShareKind; texture and buffer swizzles ignore
+                               an arm whose kind isn't theirs */
+    bool     alloc_new;     /* true: producer allocates; false: consumer reuses fd */
+    bool     derive_layout; /* texture window into an existing fd: the layout is
+                               DERIVED from the descriptor (producer-style)
+                               rather than shipped, because the placement is the
+                               first sight of this surface — there is no
+                               producer POD to validate against. alloc_new is
+                               false: the backing is the heap's existing object */
+
+    /* Producer inputs (alloc_new == true). */
+    uint64_t extra_bytes;   /* extra shm past the page-aligned payload (e.g. the
+                               keyed-mutex page), page-aligned itself */
+    uint64_t request_bytes; /* DMN_SHARE_BUFFER only: the byte length to back.
+                               Kept separate from existing_size, which it used
+                               to share — one field meaning "how big to make it"
+                               on one path and "how big it already is" on the
+                               other made every read of it ambiguous. */
+
+    /* Consumer inputs (alloc_new == false). */
+    int      existing_fd;   /* fd to mmap. BORROWED: owned by the caller, never
+                               closed here and never handed to a deallocator */
+    uint64_t existing_stride;
+    uint64_t existing_size;
+    uint64_t existing_offset; /* byte offset into existing_fd. Buffer windows
+                               need it page-aligned (an MTLBuffer starts at its
+                               mapping); texture windows map from the page floor
+                               and place the texture at the in-buffer delta */
+    uint64_t existing_max;  /* bytes available at existing_offset. 0 means a
+                               plain import: existing_size is a hard ceiling.
+                               Nonzero lets the substitution grow to whatever
+                               D3DMetal asked for, up to this, so a rounded-up
+                               placed size stays a legal alias of the window
+                               instead of an error */
+    bool     create_not_zeroed; /* the hook passes CREATE_NOT_ZEROED to the
+                               framework create, so it provably cannot write
+                               the aliased bytes: the zero-fill detection
+                               skips its snapshot/check entirely */
+
+    /* Consumer/window BUFFER captures without create_not_zeroed: the bytes
+     * the impostor aliases belong to a producer, so the swizzle snapshots
+     * them at capture and dmn_share_disarm compares once the create has
+     * returned — a create that zeroed them sets zero_filled and the hook
+     * FAILS the import (detection, never repair: see the zero-fill
+     * detection block in dmn_share_metal.mm). Snapshot owned by the arm;
+     * freed at disarm. */
+    void*    zerochk_dst;
+    void*    zerochk_copy;
+    size_t   zerochk_len;
+    bool     zero_filled;   /* out: the create zeroed aliased bytes */
+
+    /* Filled by the swizzle on capture. */
+    bool     init_dropped;  /* producer/import: the sentinel initial-data upload was
+                               intercepted and discarded (see
+                               dmn_share_init_data_sentinel) */
+    bool     captured;
+    int      out_fd;        /* the fd backing the substitution. Producer
+                               (alloc_new): newly created, and OWNED BY THE
+                               CALLER from here — the registration dups it and
+                               the hook closes it (or closes it on a failed
+                               create); the substituted MTLBuffer owns only the
+                               mapping, so fd reclamation is eviction-time
+                               exact instead of riding D3DMetal's deferred
+                               Metal releases. Consumer/window: existing_fd
+                               echoed back, still owned by the caller. */
+    uint64_t out_stride;
+    uint64_t out_size;
+};
+
+extern "C" {
+
+/* Arm the calling thread for the next Metal texture creation. extra_bytes
+ * requests additional shared memory past the page-aligned texture bytes
+ * (found by a consumer at page_align(pod.size)); 0 for none. */
+void dmn_share_arm_producer(uint64_t extra_bytes);
+/* `offset` is the byte offset of the surface within `fd` (a texture placed in
+ * a shared heap); 0 for a committed surface, which owns its whole object. */
+void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size,
+                            uint64_t offset);
+/* Arm for the next Metal texture creation, backing it with the window of `fd`
+ * at byte `offset` (need not be page-aligned): the layout is derived from the
+ * descriptor and must fit in the max_size bytes available there. The fd is
+ * BORROWED (the heap owns it); the substituted texture's backing only munmaps
+ * its own window. Used for a texture placed in a shared heap. */
+void dmn_share_arm_texture_window(int fd, uint64_t offset, uint64_t max_size);
+/* Arm the calling thread for the next raw MTLBuffer creation (device
+ * newBufferWithLength:options: or heap newBufferWithLength:options:offset:).
+ * `size` is the byte length to back with shared memory. For the consumer
+ * variants, `create_not_zeroed` declares that the wrapped create carries
+ * D3D12_HEAP_FLAG_CREATE_NOT_ZEROED (see DmnShareArm::create_not_zeroed);
+ * pass false for any create the framework may still zero-fill. */
+void dmn_share_arm_producer_buffer(uint64_t size);
+void dmn_share_arm_consumer_buffer(int fd, uint64_t size,
+                                   bool create_not_zeroed);
+/* Arm for the next raw MTLBuffer creation, backing it with the window of
+ * `fd` at page-aligned `offset`: [offset + 0, offset + size) is the placed
+ * resource, and up to max_size bytes exist at `offset` for D3DMetal's
+ * size rounding. The fd is BORROWED (the imported-heap record owns it);
+ * the substituted buffer's deallocator only munmaps its own window. */
+void dmn_share_arm_import_window(int fd, uint64_t offset, uint64_t size,
+                                 uint64_t max_size, bool create_not_zeroed);
+/* Disarm; copies the capture result into *out (may be NULL). Returns whether a
+ * substitution was actually captured. Logs loudly if armed-but-not-captured. */
+bool dmn_share_disarm(DmnShareArm* out);
+/* Whether the calling thread currently has an arm pending. Lets a re-entrant
+ * COM hook (e.g. CreateCommittedResource called from a consumer reconstruct)
+ * pass straight through instead of re-detecting a producer create. */
+bool dmn_share_is_armed(void);
+
+/* Install the device/heap ObjC swizzles. Idempotent, must run before D3DMetal
+ * loads. No-op-safe to call repeatedly. */
+void dmn_share_install_swizzles(void);
+
+/* pSysMem for intercepted D3D11_SUBRESOURCE_DATA used by imports and supported
+ * fresh shared producers without caller initial data.
+ *
+ * A texture created with no initial data is undefined as far as D3DMetal is
+ * concerned, and the first render pass that attaches it loads with a clear
+ * rather than with its contents — which for an imported shared surface throws
+ * away everything the producer put there. Passing initial data marks it
+ * defined; the copy of that data is then intercepted and dropped, so nothing
+ * is actually written over the producer's pixels.
+ *
+ * Returns NULL if the sentinel region could not be reserved, in which case the
+ * caller must pass no initial data rather than an unrecognisable pointer. */
+const void* dmn_share_init_data_sentinel(void);
+
+/* == Shared-memory helpers used by the C-API + fence (no Metal needed) ==== */
+
+/* mmap the fd PROT_READ|PROT_WRITE, MAP_SHARED. Returns NULL on failure. */
+void* dmn_share_map_fd(int fd, size_t size);
+void  dmn_share_unmap(void* ptr, size_t size);
+
+/* Round up to the page size (the trailer-offset rule shared by producer
+ * allocation and consumer lookup). */
+size_t dmn_share_page_align(size_t n);
+
+/* Anonymous shared-memory fd of `size` bytes (shm_open + immediate unlink),
+ * CLOEXEC. -1 on failure. Also used by the exported-swapchain backend. */
+int dmn_share_anon_file(size_t size);
+
+} /* extern "C" */
