@@ -2,6 +2,17 @@
 #include "../bridge/wine_audio_bridge.cpp"
 #include <CoreAudio/CoreAudio.h>
 
+extern "C" bool wine_bridge_own_pe_name(char*,size_t) { return false; }
+bool dmn_scene_source_snapshot(DmnSceneSourceSnapshot* out) noexcept {
+    *out={};return false;
+}
+extern "C" dmn_audio_status dmn_audio_tap_create_idle(dmn_audio_tap**,dmn_audio_error*) {
+    return DMN_AUDIO_DISABLED;
+}
+extern "C" dmn_audio_status dmn_audio_tap_retarget_pid(dmn_audio_tap*,int32_t,dmn_audio_error*) {
+    return DMN_AUDIO_DISABLED;
+}
+
 extern "C" dmn_audio_status dmn_audio_tap_create(int32_t, dmn_audio_tap**, dmn_audio_error*) {
     return DMN_AUDIO_DISABLED;
 }

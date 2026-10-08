@@ -14,7 +14,7 @@ Call scripts from the repository or by absolute path. Append the same `--root PA
 | Image-only diagnosis | `./scripts/launch_alyx.sh --no-audio` |
 | Reconnect selected headset | `./scripts/connect_headset.sh` |
 | Stop owned prefix | `./scripts/stop.sh` |
-| Read audio-source readiness | `./scripts/audio_status.sh` |
+| Read scene observer metadata | `./scripts/audio_status.sh` |
 | 30s fresh-video sample | `./scripts/measure.sh --seconds 30` |
 
 For settings, open the Dashboard and select **Settings**; do not run the installer again. The running owned server also exposes `http://127.0.0.1:8083/`. This differs from the original development wrapper's port 8082.
@@ -32,31 +32,29 @@ The script backs up binary `shortcuts.vdf`, retains existing entries and adds **
 
 Manual alternative: Steam → Games → Add a Non-Steam Game → Browse → `C:\ALVR\ALVR Dashboard.exe` → Add Selected Programs.
 
-This shortcut opens the Dashboard; it does not perform the complete ordered audio/game bootstrap. For a Finder entry to that bootstrap:
+## Normal Steam workflow
 
-```sh
-./scripts/make_gui_launcher.sh
+1. Connect Quest by USB, wear it and open ALVR in the headset. Create the native Mac adb tunnel with `./scripts/connect_headset.sh` after connecting the cable; repeat if the tunnel is lost. The script uses the selected authorized device and does not stop other adb servers.
+2. Open `SteamVR.app` in Finder. Despite its name, the wrapper opens **Windows Steam**. Wait for your library/login to finish.
+3. Open **ALVR Dashboard (alyx-macos)** from that Steam library, then start SteamVR from ALVR or Steam.
+4. Keep **Settings → Audio → Game audio** enabled. The adapter selects the active SteamVR game automatically; do not write an `audio-source.pid` file or choose a PID by hand.
+5. In Alyx's Steam **Properties → General → Launch Options**, set these options once:
+
+```text
+-dx11 -nomultiview -novid +vr_fidelity_level_auto 0 +vr_fidelity_level 3 +vr_msaa 2
 ```
 
-It creates `Alyx VR.app` in the private root and logs to `logs/gui-launch.log`. Its GUI/game/audio acceptance is unvalidated; keep the repository and Python at their original paths.
+6. Start Alyx from Steam. Wear Quest, take both controllers and verify image, controls and audible game sound.
 
-## Known startup audio issue
+The observer runs in the background and selects only the active scene process. With no eligible game, the source is empty. The implementation can retarget without restarting vrserver; switching between arbitrary VR titles has not been accepted on a headset. Details and upgrade steps: [audio](audio.md).
 
-Manual GUI starts showed silent headset audio/E_NOTIMPL; investigation is ongoing in the original experiment. A separate transient Steam exit also caused Alyx's SteamAPI initialization to fail before audio creation. The packaged launcher checks that owned Steam remains stable before starting the game, but that is **not a proven complete fix** for the GUI/audio issue. An absent source failure was not proven to be permanently cached. Historical successful audio and offline tests do not validate every new launch.
+## Scripted launch
 
-## Full launcher sequence
+`launch_alyx.sh` remains an optional cold bootstrap: it refuses another running VR prefix, stops only this prefix, starts Steam/ALVR/vrserver/compositor, checks Steam stability, starts Alyx with saved fidelity/MSAA and reconnects USB. Game audio is enabled before the game and follows the scene automatically. `--no-audio` keeps Game audio off for diagnosis.
 
-1. Refuse to use the headset while a different VR Wine prefix is running.
-2. Stop only this prefix; clear the stale audio-source PID.
-3. Open Steam and wait 30s for initialization; start ALVR, vrserver and vrcompositor without the invisible Dashboard/Home/monitor.
-4. Start Alyx with DX11, fixed fidelity and saved MSAA.
-5. Wait for this game's audio output, select its native PID, enable GameAudio and reconnect the USB client.
+The cold restart is a launcher choice, **not a requirement to select a new audio PID**. `--save` requests a valid existing save; menu interaction may still be needed. macOS may request capture consent; approve it for the wrapper/terminal identified by macOS. No prompt by itself does not prove failure.
 
-The cold restart is intentional: the audio tap caches one game source until vrserver exits. Restarting only `hlvr.exe` can leave audio attached to the old process. Scripts never globally kill Wine or stop a different wrapper.
-
-Steam may need login/download/failure-confirmation dialogs. macOS may request capture consent; Quest must authorize USB debugging. Wear the headset, keep ALVR foreground, take both controllers, acknowledge the game warning and load a save if the menu remains.
-
-The launcher passes `+vr_fidelity_level_auto 0 +vr_fidelity_level 3 +vr_msaa 2` using the saved MSAA value. Steam's ordinary **Play** button does not automatically inherit these project flags. `--save` requests a valid existing file; startup/menu interaction may still be needed.
+`make_gui_launcher.sh` can create an optional `Alyx VR.app` for this full scripted bootstrap. It is not required for normal Steam launches and has not received a separate fresh-install GUI acceptance test. Keep the repository/Python paths in place; its log is `logs/gui-launch.log`. Old separately created launchers may load old adapters; do not use one as an upgrade method.
 
 ## Private state and backups
 

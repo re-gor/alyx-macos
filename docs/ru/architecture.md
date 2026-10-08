@@ -20,7 +20,9 @@ flowchart LR
 
 Error/finger/trace модули имеют exact-layout guards. Activation-wait эксперимент выключен. Трассировка/запись по умолчанию off; trigger ограничен приватным broker namespace.
 
-`wine_audio_bridge.cpp` — guarded loopback/выбор процесса. `src/bridge/audio/` — private CoreAudio tap/aggregate. Mac playback сохраняется; microphone off. `source_ready_probe.cpp` читает готовность без записи.
+`wine_audio_bridge.cpp` заранее регистрирует guarded loopback-таблицу независимо от готовности графики. `src/scene/AudioSceneWatcher.exe` собирается из исходников и наблюдает SteamVR как OpenVR Background-приложение; `GetCurrentSceneProcessId` определяет активную игру. `wine_scene_source.cpp` переводит Windows PID через закреплённый протокол Wine и проверяет native identity/start time/prefix. `src/bridge/audio/` держит стабильный приватный CoreAudio tap/aggregate и переключает его только на эту игру. Звук Mac не глушится; без игры список источников пустой, общий захват не включается. Микрофон выключен.
+
+При смене источника согласуются Wine Start/Stop/Reset и выданные потребителю буферы. GetNextPacketSize, slot 21, тоже проверяет появление игры: CPAL вызывает его до GetBuffer, поэтому пустой tap не должен блокировать поиск. Wine Stop означает остановку потребителя, а не доказанный останов HAL AudioUnit. UID/ASBD проверяются; небезопасный перезапуск отклоняется. См. [звук](audio.md). `source_ready_probe.cpp` остался старым диагностическим инструментом, обычный запуск его не использует.
 
 ALVR DLL остаётся pinned vendor-бинарником. `patches/` — source equivalents, а не пересобранная DLL. SW encoder по-прежнему делает readback/конверсию/x264 all-I; hardware VideoToolbox не подключён.
 

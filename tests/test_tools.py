@@ -1,17 +1,18 @@
 import copy
+import hashlib
 import io
 import json
 from pathlib import Path
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, PropertyMock
 import zipfile
 import contextlib
 
 from alyx_macos.core import Error, Layout, REPO, extract, write_json
 from alyx_macos.configuration import apply_profile, change_settings, game_flags
-from alyx_macos.configuration import wine_registry_values
+from alyx_macos.configuration import wine_registry_values, EXPECTED_WATCHER_SHA
 from alyx_macos.cli import main
 from alyx_macos.runtime import require_no_other_vr
 
@@ -144,5 +145,78 @@ class ToolsTests(unittest.TestCase):
                  patch('alyx_macos.runtime.time.sleep',side_effect=sleep):
                 self.assertEqual(ensure_steam_stable(layout,stable_seconds=1,timeout=5),222)
                 start.assert_called_once()
+
+    def test_scene_exports_reach_direct_and_finder_launches(self):
+        from alyx_macos.configuration import install_built_adapter
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            layout=Layout(Path(tmp)/'own');layout.create()
+            (layout.app/'Contents').mkdir(parents=True)
+            info=layout.app/'Contents/Info.plist'
+            info.write_bytes(plistlib.dumps({'CLI Custom Commands':'old'}))
+            layout.alvr.mkdir(parents=True);(layout.alvr/'ALVR Dashboard.exe').write_bytes(b'fake')
+            artifacts=Path(tmp)/'repo';(artifacts/'.build/native').mkdir(parents=True)
+            (artifacts/'.build/native/libd3dmetal-native.dylib').write_bytes(b'fake native')
+            (artifacts/'.build/libwine-utm-bridge.dylib').write_bytes(b'fake bridge')
+            watcher=artifacts/'.build/scene/AudioSceneWatcher.exe'
+            watcher.parent.mkdir();watcher.write_bytes(b'fake watcher')
+            with patch('alyx_macos.configuration.REPO',artifacts),\
+                 patch('alyx_macos.configuration.EXPECTED_WATCHER_SHA',hashlib.sha256(b'fake watcher').hexdigest()),\
+                 patch('alyx_macos.configuration.run'),\
+                 contextlib.redirect_stdout(io.StringIO()):
+                install_built_adapter(layout)
+            exported=plistlib.loads(info.read_bytes())['CLI Custom Commands']
+            self.assertIn('export DMN_AUDIO_SOURCE_MODE=scene',exported)
+            self.assertIn('export WINESERVER=',exported)
+            self.assertEqual((layout.alvr/'AudioSceneWatcher.exe').read_bytes(),b'fake watcher')
+            with patch.object(Layout,'broker',new_callable=PropertyMock,return_value=Path(tmp)/'broker'):
+                env=layout.env()
+            self.assertEqual(env['DMN_AUDIO_SOURCE_MODE'],'scene')
+            self.assertEqual(env['WINESERVER'],str(layout.engine/'bin/wineserver'))
+            self.assertNotIn('DMN_AUDIO_SOURCE_PID',env)
+
+    def test_missing_watcher_refuses_config_before_any_mutation(self):
+        from alyx_macos.configuration import configure
+        with tempfile.TemporaryDirectory() as tmp:
+            layout=Layout(Path(tmp)/'own');layout.create()
+            artifacts=Path(tmp)/'repo';(artifacts/'.build/native').mkdir(parents=True)
+            (artifacts/'.build/native/libd3dmetal-native.dylib').write_bytes(b'fake')
+            (artifacts/'.build/libwine-utm-bridge.dylib').write_bytes(b'fake')
+            with patch('alyx_macos.configuration.REPO',artifacts),\
+                 patch('alyx_macos.configuration.assert_stopped'),\
+                 patch('alyx_macos.configuration.run') as command:
+                with self.assertRaises(Error):configure(layout)
+            command.assert_not_called()
+            self.assertFalse(layout.session.exists())
+            self.assertFalse((layout.root/'backups').exists())
+
+    def test_automatic_launch_does_not_write_manual_source_or_probe(self):
+        from alyx_macos.runtime import launch
+        with tempfile.TemporaryDirectory() as tmp:
+            layout=Layout(Path(tmp)/'own');layout.create()
+            for file in [layout.game/'bin/win64/hlvr.exe',layout.steamvr/'bin/win64/vrserver.exe',
+                         layout.steamvr/'bin/win64/vrcompositor.exe',
+                         layout.prefix/'drive_c/windows/system32/msvcp140.dll',
+                         layout.alvr/'AudioSceneWatcher.exe']:
+                file.parent.mkdir(parents=True,exist_ok=True);file.write_bytes(b'fake')
+            write_json(layout.session,json.loads((REPO/'config/alvr-session-template.json').read_text()))
+            with patch('alyx_macos.runtime.require_no_other_vr'),\
+                 patch('alyx_macos.runtime.stop'),patch('alyx_macos.runtime.start_steam'),\
+                 patch('alyx_macos.runtime.time.sleep'),patch('alyx_macos.runtime.spawn_wine'),\
+                 patch('alyx_macos.runtime.wait_pid',return_value=123),\
+                 patch('alyx_macos.runtime.assert_api_owner'),\
+                 patch('alyx_macos.runtime.ensure_steam_stable'),\
+                 patch('alyx_macos.runtime.connect_headset'),\
+                 patch('alyx_macos.core.sha256',return_value=EXPECTED_WATCHER_SHA),\
+                 patch('alyx_macos.runtime.subprocess.run') as probe,\
+                 contextlib.redirect_stdout(io.StringIO()):
+                launch(layout)
+            probe.assert_not_called()
+            self.assertTrue(json.loads(layout.session.read_text())['session_settings']['audio']['game_audio']['enabled'])
+
+    def test_current_template_enables_quiet_scene_audio_before_game(self):
+        session=json.loads((REPO/'config/alvr-session-template.json').read_text())
+        self.assertTrue(session['session_settings']['audio']['game_audio']['enabled'])
+        self.assertFalse(session['session_settings']['audio']['microphone']['enabled'])
 
 if __name__=='__main__':unittest.main()

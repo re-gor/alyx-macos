@@ -8,7 +8,7 @@ Windows **Half-Life: Alyx locally on Apple Silicon macOS**, using Wine/Sikarugir
 
 The original installation displayed Alyx scenes, tracked hands/buttons and streamed audio on an M4 Pro 48 GB/macOS 15.8/Quest 3. The packaged adapters build, but the full fresh-machine installation workflow has **not** had a complete headset/game acceptance test. See [validation](docs/en/development.md).
 
-**Known issue:** reliable audio on manual GUI startup is still being investigated. See [startup limitations](docs/en/usage.md#known-startup-audio-issue); no complete GUI/audio fix is claimed.
+**Audio update, 8 October 2026:** the user reports sound fixed in the original installation. This snapshot includes automatic active-game capture for the Steam → ALVR → SteamVR → game workflow; no manual audio PID selection. See [audio and upgrading](docs/en/audio.md). Other VR games and a complete fresh-machine installation remain unvalidated.
 
 ## Guides
 

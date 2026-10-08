@@ -22,4 +22,4 @@ def create(layout):
     (app/'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     run(['codesign','--force','--sign','-',app],timeout=30)
     print('Created Finder launcher:',app)
-    print('It starts the full cold bootstrap; GUI/game/audio acceptance is still unvalidated. Keep the repo/Python paths in place.')
+    print('Optional full cold bootstrap; normal Steam launches use automatic scene audio without this app. Fresh-install GUI acceptance is unvalidated. Keep repo/Python paths in place.')

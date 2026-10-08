@@ -8,6 +8,7 @@ import sys
 ROOT=Path(__file__).resolve().parent.parent
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--wine-coreaudio',type=Path,help='Read-only pinned winecoreaudio.so fixture for guarded bridge tests')
+p.add_argument('--vrclient',type=Path,help='Read-only pinned vrclient_x64.dll fixture for graphics/audio startup guards')
 args=p.parse_args()
 if platform.system()!='Darwin':raise SystemExit('Native fake tests require macOS; Python tests remain portable.')
 out=ROOT/'.build/offline-tests';out.mkdir(parents=True,exist_ok=True)
@@ -20,6 +21,12 @@ for arch in ('arm64','x86_64'):
     fake=out/('audio-fake-'+arch)
     run(common+[bridge/'audio/process_tap.cpp',bridge/'audio/process_tap_tests.cpp','-o',fake])
     run([fake])
+    scene=out/('wine-scene-fake-'+arch)
+    run(common+[bridge/'wine_audio_scene_test.cpp','-framework','CoreAudio','-framework','Foundation','-o',scene])
+    run([scene])
+    mapper=out/('scene-mapping-fake-'+arch)
+    run(common+[ROOT/'src/scene/native_tests.cpp','-o',mapper])
+    run([mapper])
     if args.wine_coreaudio:
         fixture=args.wine_coreaudio.expanduser().resolve()
         if not fixture.is_file():raise SystemExit('Read-only Wine fixture does not exist')
@@ -27,4 +34,9 @@ for arch in ('arm64','x86_64'):
         run(common+[bridge/'wine_audio_bridge_test.cpp','-framework','CoreAudio','-framework','Foundation','-o',test])
         run([test,fixture])
 if not args.wine_coreaudio:print('Wine exact-binary guard tests skipped: no fixture supplied.')
+if args.vrclient:
+    scope=out/'scope-fake-x86_64'
+    run(['clang++','-arch','x86_64','-std=c++17','-mmacosx-version-min=14.0',
+         '-pthread',bridge/'wine_scope_test.cpp','-o',scope])
+    run([scope,args.vrclient.expanduser().resolve()])
 print('Offline fake tests passed; no headset, game, HAL, recording or GPU was started.')

@@ -1,24 +1,24 @@
 {
   "upstream": "https://github.com/utmapp/d3dmetal-native",
   "base_commit": "f0dd1fafded509c9a949535c773fdc4e3ab07a71",
-  "source_snapshot": "Local tested graphics fixes plus current audio adapter source; packaged build/clean-install validation recorded separately.",
+  "source_snapshot": "Tested graphics fixes and active-scene automatic audio with empty-packet polling; portable packaging validated separately.",
   "files": {
     "src/bridge/alvr_activation_bridge.cpp": "65510d5036a68e5bbc4d29b392b60dfb463cf578bbff64c0ed5860ad5c4725c1",
     "src/bridge/alvr_error_bridge.cpp": "84197cba71fd0b32e0a07a38b5d19e0c23176661741fc19624581e8ee6827d73",
     "src/bridge/alvr_finger_bridge.cpp": "fd80bccc7e795b2cdfbd1ff9e3dd3dc566630cf9d92b722b6c4d8dc1ee9bee57",
     "src/bridge/alvr_frame_trace.cpp": "56f530c08af8e22305122cea5717ec5b3cc2209f24bc0e56f9cbdc91d0664478",
-    "src/bridge/audio/process_tap.cpp": "e4b3345d982034e6280fb921db74c134475d963d8ec5a9330932c1ddb2a0f189",
-    "src/bridge/audio/process_tap.h": "bc834bb8be1957394c2f9d7dd55b77cee0871bdf02c3f04627d357b604b2b917",
-    "src/bridge/audio/process_tap_backend.h": "e875166f9f956ee62c054f95d3ab837a37e619abb10f7c63208a96c2aa36de34",
-    "src/bridge/audio/process_tap_native.mm": "742ce7cf37f775960f87777086679e1f5fb5bd2aa3852d1e6c1f985b9cd980b7",
+    "src/bridge/audio/process_tap.cpp": "fe0c3ad9a704de79bf802a15485bbfb3bda824bfeead67d8abd141fd87aaba01",
+    "src/bridge/audio/process_tap.h": "1a7942f446f141e845f71f2dd2b591b322487ba76daabd352ff3cb69dd33800e",
+    "src/bridge/audio/process_tap_backend.h": "88dc15ec42844c942c25f5d25194b91956b30b6beec4bf79549a018f49c80885",
+    "src/bridge/audio/process_tap_native.mm": "593e840b0b3084bf13b65b5c95c3a4fba0ef64752c16f31039ae790bd80cf145",
     "src/bridge/audio/process_tap_probe.cpp": "03f1a5e46a4c2cbffb74e2b8b70237c2756cb36f2c785c526c5ea320a3fd0ebd",
-    "src/bridge/audio/process_tap_tests.cpp": "d4ad103104ee6d08dff2cafbff672da38ae2ddef72e1edfc96f93dc0988a9434",
+    "src/bridge/audio/process_tap_tests.cpp": "e124450cab6916859874a6d01ed1f63e695a642b3d1e7861dc788aabb6582f60",
     "src/bridge/client_frame_trace.cpp": "820b8f0b438b2192ba84fa06262cadd863cbd6afa8471c76978089a32f00d7e0",
     "src/bridge/compositor_frame_trace.cpp": "f7470bf14c0d0b26b57d0510eda4a3cc20561cc618c63bcb9da20c908e3d6cd9",
     "src/bridge/native_helper_noop.c": "f9f48735105fc65a42c98cc3645e4b0f3c457cb0b438ec795e0de94e62cb06de",
-    "src/bridge/wine_audio_bridge.cpp": "a447e34b811e81fe238029ec88c4f108914d67fd3d91cf12ead0228c50a01b2c",
-    "src/bridge/wine_audio_bridge_test.cpp": "91d3609fd21782cb89e38c07cd8004286cdd79e04a82f842471c6a54589f70d6",
-    "src/bridge/wine_bridge.cpp": "d68c41ab7e7ba5cddef6277d79359f5bdbb68c67086e19609de1b0a7c2ea2408",
+    "src/bridge/wine_audio_bridge.cpp": "5e19498ec34956adc373533bf0f82141ce266603b6af94f8f89f105f40cfbe05",
+    "src/bridge/wine_audio_bridge_test.cpp": "d60184e566c96c44ebdb6b1f1efcf0044074d918c572b60917a92e300327110f",
+    "src/bridge/wine_bridge.cpp": "a2a62393177b86919c05d9710752106f06942c366a9b7b373ad43deabfd48018",
     "src/d3dmetal-native/.gitignore": "dc38ceccea0d77f3bd78bd855d81c5889b87e71082b6fd854f9a916bec3b0b10",
     "src/d3dmetal-native/LICENSE": "0c9f2c12024a4c1fdc4780309054c02f5e4fb9ca0860edc92869f5bc32b10aa3",
     "src/d3dmetal-native/README.md": "e1253983f135b1bbed1639c4d4b922ffb3b1fd8e4390ac0614e48f029c459641",
@@ -220,11 +220,46 @@
     "src/d3dmetal-native/tests/sparse_tiled_test.cpp": "fffe73368f45db0b9fd583c6e5a6a90fc4867b7657d11f0795bff0a32976d903",
     "src/d3dmetal-native/tests/steamvr_constant_buffer_test.cpp": "8596841801b278c9d50ee71ca7402e38b5a7a921512f62c7eddefd4877b0a8af",
     "src/d3dmetal-native/tests/tiled_probe.cpp": "81aa332007d3f7f5556b352b798baa56a5e88a86252435f2916e4f53e97c6dec",
-    "src/probes/source_ready_probe.cpp": "7e65fabc53da74be1dda97df69cc588afac03134cd3712eefe7cad271f9d77ca"
+    "src/probes/source_ready_probe.cpp": "77cc0e87f523d1a547223845262187c48373c446c11b1372318b889db9fbe2ff",
+    "src/bridge/wine_scene_source.cpp": "c6d77400577ec3f5e7a87da9c00873f961c9cecc521b2c4211d8ba3e8faf90c8",
+    "src/bridge/wine_scene_source.h": "2acc3a85f3dc6ad8f523994178e5f1319f1a1e8b2c63aab1c5d354e073bf15d7",
+    "src/bridge/wine_audio_scene_test.cpp": "db94b0cbec31624c6be1fe096f5c3bcb1d3b75b2165ab9445908837981bdb71f",
+    "src/bridge/wine_process_scope.h": "e7b49f9551ca541b0bec99d95f35ecaf46c466e4f60298a5df40661743d78f9f",
+    "src/bridge/wine_scope_test.cpp": "d93998b17d8bb4d837a84758d0641005a91d1e2fd58754d66a71d17f644aeeaf",
+    "src/scene/scene_watcher.cpp": "e257fe476ce6e43d7c3d2d728cfacce78cf9560721387430a7cddc5865e09a02",
+    "src/scene/expected_native.h": "a06b3d6a8e4bd340bfd0a5a2d510e44fd73b61463402d989ec14675a2ae677d3",
+    "src/scene/native_tests.cpp": "430fd7dd35ce4215bda3abf8c9be1ea787bcb178236c998827aa6da973412c17",
+    "src/scene/build_watcher.py": "bb610a40267ca0058b2842a1a91ec6869db051b92d1ea5b21231fc0f8010b882",
+    "src/scene/make_pe.py": "3e7463d1644a580093d9329acba5327d8eb2b51d24b6d07d4687d1ec23233263",
+    "src/scene/scene_wire.h": "3962fdbf335fb217b70b196d9fbebae1b02893d5f18f332381a32c68496400b6"
   },
   "packaging_changes": [
     "Private-broker trace guard",
     "Meson>=1.1",
-    "Portable source-ready include"
-  ]
+    "Portable source-ready include",
+    "Portable scene watcher build into ignored .build with exact binary hash check",
+    "Portable scene includes and standalone fake tests"
+  ],
+  "audio_update": {
+    "date": "2026-10-08",
+    "user_report": "User confirmed sound fixed in the original installation. Fresh-machine install remains unvalidated.",
+    "original_sha256": {
+      "src/bridge/wine_bridge.cpp": "a2a62393177b86919c05d9710752106f06942c366a9b7b373ad43deabfd48018",
+      "src/bridge/wine_process_scope.h": "e7b49f9551ca541b0bec99d95f35ecaf46c466e4f60298a5df40661743d78f9f",
+      "src/bridge/wine_scene_source.cpp": "67526729b6113814cf3a572f041587eaa3587dd7ac7e7f78c79888bbc0f578b9",
+      "src/bridge/wine_scene_source.h": "2acc3a85f3dc6ad8f523994178e5f1319f1a1e8b2c63aab1c5d354e073bf15d7",
+      "src/bridge/wine_audio_bridge.cpp": "5e19498ec34956adc373533bf0f82141ce266603b6af94f8f89f105f40cfbe05",
+      "src/bridge/wine_audio_bridge_test.cpp": "d60184e566c96c44ebdb6b1f1efcf0044074d918c572b60917a92e300327110f",
+      "src/bridge/wine_audio_scene_test.cpp": "db94b0cbec31624c6be1fe096f5c3bcb1d3b75b2165ab9445908837981bdb71f",
+      "src/bridge/audio/process_tap.cpp": "fe0c3ad9a704de79bf802a15485bbfb3bda824bfeead67d8abd141fd87aaba01",
+      "src/bridge/audio/process_tap.h": "1a7942f446f141e845f71f2dd2b591b322487ba76daabd352ff3cb69dd33800e",
+      "src/bridge/audio/process_tap_backend.h": "88dc15ec42844c942c25f5d25194b91956b30b6beec4bf79549a018f49c80885",
+      "src/bridge/audio/process_tap_native.mm": "593e840b0b3084bf13b65b5c95c3a4fba0ef64752c16f31039ae790bd80cf145",
+      "src/bridge/audio/process_tap_tests.cpp": "e124450cab6916859874a6d01ed1f63e695a642b3d1e7861dc788aabb6582f60",
+      "src/scene/scene_watcher.cpp": "e257fe476ce6e43d7c3d2d728cfacce78cf9560721387430a7cddc5865e09a02",
+      "src/scene/scene_wire.h": "3962fdbf335fb217b70b196d9fbebae1b02893d5f18f332381a32c68496400b6",
+      "src/scene/expected_native.h": "a06b3d6a8e4bd340bfd0a5a2d510e44fd73b61463402d989ec14675a2ae677d3",
+      "src/scene/native_tests.cpp": "faf699f60d686f844b6938ffe0de18873e8ca8d028b5c96d0661f9e14af06ab5"
+    }
+  }
 }

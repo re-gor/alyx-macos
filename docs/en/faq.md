@@ -28,9 +28,11 @@ Take both controllers. Confirm official x64 MSVC runtime/native override only fo
 
 Use the current owner-checked keyed mutex. Cold-restart all participants after library updates; do not hot-mix protocols. A foreign release caused the demonstrated ownership violation; GPU visibility tests and a worn-headset check followed the fix. Removing completion synchronization is not a safe performance workaround.
 
-## No headset sound after restarting only Alyx
+## No headset sound / E_NOTIMPL
 
-The tap caches one source until vrserver exits. Full launch clears the stale PID and selects a ready owned game. `audio_status.sh` reads readiness metadata without recording. Approve capture for the terminal/wrapper macOS identifies. Absence of a new permission prompt does not itself prove failure.
+Update and configure the [automatic audio adapter](audio.md), then cold-start once to load the new library. Keep Game audio enabled and Quest's ALVR foreground. The current adapter follows SteamVR's active scene; manually caching the Alyx PID is obsolete. `audio_status.sh` reads observer metadata, not PCM; `ready` proves process mapping only, not audible output. No game means a quiet empty source.
+
+Check capture consent for the wrapper/terminal macOS identifies. A missing new prompt does not prove failure. Unknown Wine/watcher binaries deliberately fail guards; retain their checks. A repeated `0x80004001` does not identify its cause alone. If the adapter enters an unsafe/poisoned state, stop this prefix and restart; do not destroy a tap still owned by Wine. Games emitting sound in another process need additional support.
 
 ## Robotic voices or gaps
 

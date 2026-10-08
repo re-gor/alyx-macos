@@ -1,6 +1,8 @@
 // Opt-in Wine10 CoreAudio loopback: selected native process -> private tap UID.
 // The stock ALVR/Wine capture and ALVR audio transport remain the consumers.
 #include "audio/process_tap.h"
+#include "wine_scene_source.h"
+#include "wine_process_scope.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <algorithm>
 #include <array>
@@ -9,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +56,14 @@ struct GetCaptureParams {
     uint64_t stream;int32_t result;uint8_t** data;uint32_t* frames;uint32_t* flags;
     uint64_t* devpos;uint64_t* qpcpos;
 };
+struct StreamOperationParams {uint64_t stream;int32_t result;};
+struct ReleaseCaptureParams {uint64_t stream;uint32_t done;int32_t result;};
+struct GetNextPacketSizeParams {uint64_t stream;int32_t result;uint32_t* frames;};
+static_assert(sizeof(GetNextPacketSizeParams)==24 && alignof(GetNextPacketSizeParams)==8);
+static_assert(offsetof(GetNextPacketSizeParams,result)==8 &&
+              offsetof(GetNextPacketSizeParams,frames)==16);
+static_assert(sizeof(StreamOperationParams)==16 && offsetof(StreamOperationParams,result)==8);
+static_assert(sizeof(ReleaseCaptureParams)==16 && offsetof(ReleaseCaptureParams,result)==12);
 static_assert(sizeof(ReleaseStreamParams)==24 && offsetof(ReleaseStreamParams,result)==16);
 static_assert(sizeof(GetCaptureParams)==56 && alignof(GetCaptureParams)==8);
 static_assert(offsetof(GetCaptureParams,result)==8 && offsetof(GetCaptureParams,data)==16);
@@ -74,6 +85,7 @@ constexpr int32_t kFailure = int32_t(0x80004005u);
 constexpr int32_t kOutOfMemory = int32_t(0x8007000eu);
 // mmdevapi checks this NTSTATUS stored in the result field, not Win32 HRESULT122.
 constexpr int32_t kBufferTooSmall = int32_t(0xc0000023u);
+constexpr int32_t kBufferEmpty = int32_t(0x08890001u);
 constexpr size_t kLoopback = 15;
 constexpr size_t kTableOffset = 0xa020;
 constexpr size_t kFileBytes = 73888;
@@ -98,6 +110,15 @@ bool enabled() {
 bool diagnostics_enabled() {
     const char* value=getenv("DMN_AUDIO_DIAGNOSTICS");
     return value && strcmp(value,"1")==0;
+}
+bool scene_enabled() {
+    const char* value=getenv("DMN_AUDIO_SOURCE_MODE");
+    return value && strcmp(value,"scene")==0;
+}
+bool audio_server_scope() {
+    std::array<char,260> name{};
+    return wine_bridge_own_pe_name(name.data(),name.size()) &&
+        strcmp(name.data(),"vrserver.exe")==0;
 }
 bool readable(const void* pointer,size_t bytes) {
     if (!pointer || !bytes) return false;
@@ -165,11 +186,6 @@ bool server_argument(const char* value) {
         if (c!=expected[i]) return false;
         if (!c) return true;
     }
-    return false;
-}
-bool server_process() {
-    for (int i=0; i<*_NSGetArgc(); ++i)
-        if (server_argument((*_NSGetArgv())[i])) return true;
     return false;
 }
 int32_t producer_pid(const char* value) {
@@ -312,6 +328,12 @@ struct SignalDiagnostics {
     int32_t source_pid=0;
     bool started=false,active=false;
 };
+struct ManagedCapture {
+    uint64_t stream=0;
+    bool started=false;
+    bool borrowed=false;
+    bool suspended=false;
+};
 struct State {
     std::mutex mutex;
     std::array<UnixCall,36> table{};
@@ -324,6 +346,16 @@ struct State {
     unsigned capture_logs=0;
     bool diagnostics_installed=false;
     SignalDiagnostics diagnostics{};
+    std::array<ManagedCapture,8> captures{};
+    std::condition_variable captures_changed;
+    DmnSceneSourceSnapshot selected{};
+    uint64_t scene_poll_ns=0;
+    bool scene_mode=false;
+    bool scene_muted=true;
+    bool scene_unsafe=false;
+    unsigned scene_logs=0;
+    std::array<char,DMN_AUDIO_UID_MAX_BYTES> scene_uid{};
+    dmn_audio_format scene_format{};
 };
 #ifdef DMN_AUDIO_DIAGNOSTICS_TESTING
 void (*diagnostics_test_after_current)()=nullptr;
@@ -497,6 +529,12 @@ int32_t get_capture_observed(void* raw) {
 }
 int32_t get_loopback(void*);
 int32_t create_capture(void*);
+int32_t get_capture_managed(void*);
+int32_t get_next_packet_size_managed(void*);
+int32_t release_capture_managed(void*);
+int32_t start_managed(void*);
+int32_t stop_managed(void*);
+int32_t release_stream_managed(void*);
 void prepare_table(State& value,const UnixCall* original,bool diagnostics) {
     std::copy(original,original+value.table.size(),value.table.begin());
     value.original_table=original;value.original_loopback=original[kLoopback];
@@ -504,6 +542,13 @@ void prepare_table(State& value,const UnixCall* original,bool diagnostics) {
     value.diagnostics_installed=diagnostics;
     if (diagnostics) {
         value.table[5]=&release_stream_observed;value.table[12]=&get_capture_observed;
+    }
+    if (scene_enabled()) {
+        value.table[5]=&release_stream_managed;
+        value.table[6]=&start_managed;value.table[7]=&stop_managed;
+        value.table[12]=&get_capture_managed;value.table[13]=&release_capture_managed;
+        // Pinned Wine10 unixlib.h: next-packet-size is slot21, not slot14.
+        value.table[21]=&get_next_packet_size_managed;
     }
 }
 int32_t fallback(State* value, void* raw) {
@@ -517,15 +562,194 @@ void report_error(State& value, dmn_audio_status status, const dmn_audio_error& 
         dmn_audio_status_name(status),error.stage,error.os_status,
         error.cleanup_stage,error.cleanup_os_status);
 }
+ManagedCapture* managed_entry(State& value,uint64_t stream) {
+    for (auto& entry:value.captures) if (entry.stream && entry.stream==stream) return &entry;
+    return nullptr;
+}
+bool scene_device_valid(State& value) {
+    std::array<char,DMN_AUDIO_UID_MAX_BYTES> uid{};size_t size=0;
+    dmn_audio_format format{};
+    return dmn_audio_tap_get_uid(value.tap,uid.data(),uid.size(),&size)==DMN_AUDIO_OK &&
+        size && size<=uid.size() && uid==value.scene_uid &&
+        dmn_audio_tap_get_format(value.tap,&format)==DMN_AUDIO_OK &&
+        memcmp(&format,&value.scene_format,sizeof(format))==0;
+}
+bool stream_operation(State& value,size_t index,uint64_t stream) {
+    if (!value.original_table || !value.original_table[index]) return false;
+    if (index==6 && (!scene_device_valid(value) || value.scene_unsafe)) return false;
+    StreamOperationParams args{stream,kFailure};
+    return value.original_table[index](&args)==0 && args.result==0;
+}
+void empty_capture(GetCaptureParams& args) {
+    if (args.data) *args.data=nullptr;
+    if (args.frames) *args.frames=0;
+    if (args.flags) *args.flags=0;
+    args.result=kBufferEmpty; // Standard WASAPI successful zero-frame status.
+}
+bool refresh_scene_locked(State& value) {
+    if (!value.scene_mode || !value.ready || value.scene_unsafe) return false;
+    const uint64_t now=signal_now_ns();
+    if (now<value.scene_poll_ns) return !value.scene_muted;
+    value.scene_poll_ns=now+100000000ULL;
+    DmnSceneSourceSnapshot wanted{};
+    if (!dmn_scene_source_snapshot(&wanted) || !wanted.ready) wanted={};
+    const int32_t pid=wanted.ready ? wanted.native_pid : 0;
+    if (pid==value.selected.native_pid && wanted.start_time==value.selected.start_time &&
+        wanted.wine_pid==value.selected.wine_pid && !(pid && value.scene_muted)) {
+        return !value.scene_muted;
+    }
+    value.scene_muted=true;
+    // Never stop/reset a stream while a caller still owns its borrowed packet.
+    for (const auto& entry:value.captures) if (entry.borrowed) return false;
+    std::array<uint64_t,8> resume{};size_t count=0;
+    bool stopped=true;
+    for (auto& entry:value.captures) {
+        if (!entry.stream || !entry.started) continue;
+        if (stream_operation(value,7,entry.stream)) {
+            entry.started=false;entry.suspended=true;
+            if (!stream_operation(value,8,entry.stream)) stopped=false;
+        } else stopped=false;
+    }
+    if (!stopped) {
+        value.scene_unsafe=true;
+        if (value.scene_logs++<64)
+            fprintf(stderr,"WINE-AUDIO: capture suspend/reset failed; source update suspended\n");
+        return false; // Never mutate a tap while quiescence is unconfirmed.
+    }
+    for (const auto& entry:value.captures)
+        if (entry.stream && entry.suspended) resume[count++]=entry.stream;
+    dmn_audio_error error{};
+    const auto status=dmn_audio_tap_retarget_pid(value.tap,pid,&error);
+    const bool valid=scene_device_valid(value);
+    if (status==DMN_AUDIO_TARGET_UNSAFE || status==DMN_AUDIO_NOT_READY || !valid) {
+        value.scene_unsafe=true;report_error(value,status,error);
+        // Keep capture suspended; do not destroy a UID still held by Wine.
+        return false;
+    }
+    const bool selected=stopped && status==DMN_AUDIO_OK;
+    if (selected) value.selected=wanted;
+    else {
+        value.selected={};
+        if (status!=DMN_AUDIO_OK) report_error(value,status,error);
+    }
+    bool resumed=true;
+    for (size_t i=0;i<count;++i) {
+        auto* entry=managed_entry(value,resume[i]);
+        if (!entry) continue;
+        entry->started=stream_operation(value,6,entry->stream);
+        entry->suspended=!entry->started;
+        if (!entry->started) resumed=false;
+    }
+    value.scene_muted=!selected || !resumed || pid==0;
+    if (value.scene_logs++<64) fprintf(stderr,
+        "WINE-AUDIO: scene wine=%u native=%d generation=%llu selected=%u status=%u io_stopped=%u resumed=%u\n",
+        wanted.wine_pid,pid,(unsigned long long)wanted.generation,
+        uint32_t(selected),uint32_t(status),uint32_t(stopped),uint32_t(resumed));
+    return !value.scene_muted;
+}
+int32_t start_managed(void* raw) {
+    State* value=state();
+    if (!value || !value->original_table || !raw) return 0;
+    auto& args=*static_cast<StreamOperationParams*>(raw);
+    std::lock_guard<std::mutex> lock(value->mutex);
+    if (managed_entry(*value,args.stream) &&
+        (value->scene_unsafe || !scene_device_valid(*value))) {
+        args.result=kFailure;return 0;
+    }
+    const auto status=value->original_table[6](raw);
+    if (auto* entry=managed_entry(*value,args.stream)) {
+        entry->started=status==0 && args.result==0;entry->suspended=false;
+    }
+    return status;
+}
+int32_t stop_managed(void* raw) {
+    State* value=state();
+    if (!value || !value->original_table || !raw) return 0;
+    auto& args=*static_cast<StreamOperationParams*>(raw);
+    std::lock_guard<std::mutex> lock(value->mutex);
+    const auto status=value->original_table[7](raw);
+    if (status==0 && args.result==0)
+        if (auto* entry=managed_entry(*value,args.stream)) {
+            entry->started=false;entry->suspended=false;
+        }
+    return status;
+}
+int32_t get_capture_managed(void* raw) {
+    State* value=state();
+    if (!value || !value->original_table || !raw) return 0;
+    auto& args=*static_cast<GetCaptureParams*>(raw);
+    std::lock_guard<std::mutex> lock(value->mutex);
+    auto* entry=managed_entry(*value,args.stream);
+    if (!entry) return value->original_table[12](raw);
+    const bool audible=refresh_scene_locked(*value);
+    if (value->scene_unsafe || !audible) {
+        empty_capture(args);
+        return 0;
+    }
+    const auto status=value->diagnostics_installed ? get_capture_observed(raw)
+                                                  : value->original_table[12](raw);
+    if (status==0 && args.result==0 && args.frames && *args.frames>0)
+        entry->borrowed=true;
+    return status;
+}
+int32_t get_next_packet_size_managed(void* raw) {
+    State* value=state();
+    if (!value || !value->original_table || !raw) return 0;
+    auto& args=*static_cast<GetNextPacketSizeParams*>(raw);
+    std::lock_guard<std::mutex> lock(value->mutex);
+    if (!managed_entry(*value,args.stream)) return value->original_table[21](raw);
+    // CPAL asks this BEFORE GetBuffer and returns on size0. Discover the new
+    // game here even when an idle tap has never supplied a capture packet.
+    // Conversely, conceal stale idle packets so CPAL cannot spin on nonzero
+    // size followed by our successful zero-frame GetBuffer result.
+    const bool audible=refresh_scene_locked(*value);
+    if (value->scene_unsafe || !audible) {
+        if (args.frames) *args.frames=0;
+        args.result=0;
+        return 0;
+    }
+    return value->original_table[21](raw);
+}
+int32_t release_capture_managed(void* raw) {
+    State* value=state();
+    if (!value || !value->original_table || !raw) return 0;
+    auto& args=*static_cast<ReleaseCaptureParams*>(raw);
+    std::lock_guard<std::mutex> lock(value->mutex);
+    auto* entry=managed_entry(*value,args.stream);
+    if (entry && !entry->borrowed && args.done==0) {args.result=0;return 0;}
+    const auto status=value->original_table[13](raw);
+    if (entry && status==0 && args.result==0) {
+        entry->borrowed=false;value->captures_changed.notify_all();
+    }
+    return status;
+}
+int32_t release_stream_managed(void* raw) {
+    State* value=state();
+    if (!value || !value->original_table || !raw) return 0;
+    auto& args=*static_cast<ReleaseStreamParams*>(raw);
+    {
+        std::unique_lock<std::mutex> lock(value->mutex);
+        if (!value->captures_changed.wait_for(lock,std::chrono::milliseconds(1000),[&] {
+            const auto* entry=managed_entry(*value,args.stream);
+            return !entry || !entry->borrowed;
+        })) {
+            args.result=kFailure; // Do not free memory still borrowed by a caller.
+            return 0;
+        }
+        if (auto* entry=managed_entry(*value,args.stream)) *entry={};
+    }
+    return release_stream_observed(raw);
+}
 int32_t get_loopback(void* raw) {
     if (!raw) return 0; // The original stub returns success without dereferencing.
     State* value=state();
-    if (!value || !enabled()) return fallback(value,raw);
-    const int32_t pid=source_pid();
-    if (!pid) return fallback(value,raw);
+    if (!value || !enabled() || !audio_server_scope()) return fallback(value,raw);
+    const bool automatic=scene_enabled();
+    const int32_t pid=automatic ? 0 : source_pid();
+    if (!automatic && !pid) return fallback(value,raw);
     std::lock_guard<std::mutex> lock(value->mutex);
     auto& params=*static_cast<LoopbackParams*>(raw);
-    if (value->ready && value->pid!=pid) {
+    if (value->ready && (value->pid!=pid || value->scene_mode!=automatic)) {
         // Existing Wine consumers can still hold this UID: require cold restart.
         params.result=kFailure;
         return 0;
@@ -540,7 +764,8 @@ int32_t get_loopback(void* raw) {
                 return 0;
             }
         }
-        const auto status=dmn_audio_tap_create(pid,&value->tap,&error);
+        const auto status=automatic ? dmn_audio_tap_create_idle(&value->tap,&error)
+                                    : dmn_audio_tap_create(pid,&value->tap,&error);
         if (status!=DMN_AUDIO_OK) {
             report_error(*value,status,error);
             params.result=kFailure;
@@ -558,9 +783,11 @@ int32_t get_loopback(void* raw) {
             return 0;
         }
         value->pid=pid;
+        value->scene_mode=automatic;
+        if (automatic) value->scene_format=format;
         value->ready=true;
-        fprintf(stderr,"WINE-AUDIO: private stereo source pid=%d rate=%.0f host=%d\n",
-            pid,format.sample_rate,getpid());
+        fprintf(stderr,"WINE-AUDIO: private stereo source pid=%d rate=%.0f host=%d scene=%u\n",
+            pid,format.sample_rate,getpid(),uint32_t(automatic));
     }
     std::array<char,DMN_AUDIO_UID_MAX_BYTES> uid{};
     size_t required=0;
@@ -569,6 +796,7 @@ int32_t get_loopback(void* raw) {
         params.result=kFailure;
         return 0;
     }
+    if (automatic && value->scene_uid[0]==0) value->scene_uid=uid;
     write_uid(params,uid.data());
     return 0; // Unix-call status; params.result is the Windows initialization result.
 }
@@ -610,6 +838,22 @@ int32_t create_capture(void* raw) {
         signal_format(forwarded,observed_format);
     const int32_t status=original(&forwarded);
     params.result=forwarded.result;
+    bool untracked=false;
+    uint64_t untracked_stream=0;
+    if (value->scene_mode && status==0 && params.result==0 &&
+        readable(params.stream,sizeof(uint64_t))) {
+        uint64_t stream=0;memcpy(&stream,params.stream,sizeof(stream));
+        std::lock_guard<std::mutex> lock(value->mutex);
+        ManagedCapture* slot=managed_entry(*value,stream);
+        if (!slot) for (auto& entry:value->captures) if (!entry.stream) {slot=&entry;break;}
+        if (stream && slot) *slot={stream,false,false,false};
+        else if (stream) {untracked=true;untracked_stream=stream;}
+    }
+    if (untracked) {
+        ReleaseStreamParams release{untracked_stream,nullptr,kFailure};
+        value->original_table[5](&release);
+        *params.stream=0;params.result=kOutOfMemory;
+    }
     if (observe && status==0 && params.result==0 &&
         readable(params.stream,sizeof(uint64_t))) {
         uint64_t stream=0;memcpy(&stream,params.stream,sizeof(stream));
@@ -635,8 +879,7 @@ int32_t create_capture(void* raw) {
 }
 
 void* wine_audio_interpose_table(void* symbol, const char* name) {
-    if (!enabled() || !symbol || !name || strcmp(name,"__wine_unix_call_funcs")!=0 ||
-        !server_process()) return symbol;
+    if (!enabled() || !symbol || !name || strcmp(name,"__wine_unix_call_funcs")!=0) return symbol;
     Dl_info owner{};
     if (!dladdr(symbol,&owner) || !owner.dli_fbase || !owner.dli_fname ||
         reinterpret_cast<uintptr_t>(symbol)-reinterpret_cast<uintptr_t>(owner.dli_fbase)

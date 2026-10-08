@@ -369,7 +369,7 @@
     },
     "audio": {
       "game_audio": {
-        "enabled": false,
+        "enabled": true,
         "content": {
           "gui_collapsed": true,
           "device": {

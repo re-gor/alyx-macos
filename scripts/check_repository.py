@@ -16,7 +16,7 @@ def main():
             if not (p.parent/dest.split('#')[0]).resolve().exists():issues.append(f'{p.relative_to(ROOT)}: broken {dest}')
         if re.search(r'(?m)^#{1,6}[^#\s]',text):issues.append(f'{p.relative_to(ROOT)}: malformed heading')
     for lang in ('en','ru'):
-        for topic in ('install','usage','settings','faq','history','architecture','development'):
+        for topic in ('install','usage','settings','faq','history','architecture','development','audio'):
             if not (ROOT/'docs'/lang/(topic+'.md')).is_file():issues.append(f'Missing {lang}/{topic}')
     for p in (ROOT/'scripts').glob('*.sh'):
         subprocess.run(['sh','-n',str(p)],check=True)

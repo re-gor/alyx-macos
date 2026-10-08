@@ -23,7 +23,8 @@ typedef enum dmn_audio_status {
     DMN_AUDIO_NOT_READY = 9,
     DMN_AUDIO_CLEANUP_FAILED = 10,
     DMN_AUDIO_OUT_OF_MEMORY = 11,
-    DMN_AUDIO_INTERNAL_ERROR = 12
+    DMN_AUDIO_INTERNAL_ERROR = 12,
+    DMN_AUDIO_TARGET_UNSAFE = 13
 } dmn_audio_status;
 
 typedef enum dmn_audio_stage {
@@ -39,7 +40,10 @@ typedef enum dmn_audio_stage {
     DMN_AUDIO_STAGE_AGGREGATE_FORMAT = 9,
     DMN_AUDIO_STAGE_DESTROY_AGGREGATE = 10,
     DMN_AUDIO_STAGE_DESTROY_TAP = 11,
-    DMN_AUDIO_STAGE_ALLOCATION = 12
+    DMN_AUDIO_STAGE_ALLOCATION = 12,
+    DMN_AUDIO_STAGE_DETACH_TARGET = 13,
+    DMN_AUDIO_STAGE_SET_TARGET = 14,
+    DMN_AUDIO_STAGE_VALIDATE_TARGET = 15
 } dmn_audio_stage;
 
 typedef struct dmn_audio_error {
@@ -79,6 +83,23 @@ enum { DMN_AUDIO_FORMAT_VERSION = 1, DMN_AUDIO_UID_MAX_BYTES = 256 };
  */
 dmn_audio_status dmn_audio_tap_create(int32_t native_pid, dmn_audio_tap **out,
                                      dmn_audio_error *error);
+
+/* Explicit game-only idle input: private stereo tap with EMPTY process list,
+ * exclusive=false. Requires the same exact DMN_AUDIO_TAP=1 gate; no global or
+ * microphone fallback. UID/format/lifecycle contract is identical to create.
+ */
+dmn_audio_status dmn_audio_tap_create_idle(dmn_audio_tap **out, dmn_audio_error *error);
+
+/* Caller MUST suspend/reset capture and borrowed buffers before retarget.
+ * native_pid=0 selects nobody; positive selects only that process. The old
+ * source is detached first, and the same tap/aggregate UID and ASBD are checked.
+ * Failure never silently keeps the old source: a verified empty rollback leaves
+ * the handle ready/idle, while TARGET_UNSAFE or NOT_READY means keep capture
+ * muted/suspended. Do not destroy the handle while Wine owns its AudioUnit.
+ * error.cleanup_* report failed empty rollback or validation. No IO is started.
+ */
+dmn_audio_status dmn_audio_tap_retarget_pid(dmn_audio_tap *tap, int32_t native_pid,
+                                          dmn_audio_error *error);
 
 /* UTF-8 UID size includes the NUL. Query with buffer=NULL, capacity=0:
  * returns BUFFER_TOO_SMALL and the required size. A cleanup-only handle returns

@@ -5,9 +5,10 @@ from pathlib import Path
 import shlex
 import shutil
 
-from .core import Error, REPO, assert_stopped, run, write_json
+from .core import Error, REPO, assert_stopped, run, sha256, write_json
 
 EXPECTED_ALVR_SHA = '5b2dc0012254fa3c45268ed655c3f589b2d460a62907c620670cfb5d22a48fa8'
+EXPECTED_WATCHER_SHA = 'c4daa99a3efa4873d7a6e79c78c5c706cbeffd0e497cec7278b847bdc3409102'
 
 def wine_registry_values():
     desktop=r'HKCU\Control Panel\Desktop'
@@ -67,14 +68,17 @@ def configure(layout):
     assert_stopped(layout)
     if not (REPO/'.build/native/libd3dmetal-native.dylib').is_file() or not (REPO/'.build/libwine-utm-bridge.dylib').is_file():
         raise Error('Build the adapters first; configuration has not been changed.')
+    require_built_watcher()
+    if not (layout.alvr/'ALVR Dashboard.exe').is_file():
+        raise Error('Install ALVR before configuring the audio watcher.')
     prefs = layout.preferences()
     layout.backup([layout.session, layout.prefs, layout.app/'Contents/Info.plist',
                    layout.steam/'config/steamvr.vrsettings'], 'configure')
     session = (json.loads(layout.session.read_text()) if layout.session.exists()
                else json.loads((REPO/'config/alvr-session-template.json').read_text()))
     apply_profile(session, prefs)
-    # The audio source must be selected AFTER the next game process is ready.
-    session['session_settings']['audio']['game_audio']['enabled'] = False
+    # Empty scene means quiet idle; the observer selects the live game later.
+    session['session_settings']['audio']['game_audio']['enabled'] = True
     write_json(layout.session, session)
     write_json(layout.prefs, prefs)
     path = layout.steam/'config/steamvr.vrsettings'
@@ -93,19 +97,30 @@ def configure(layout):
     install_built_adapter(layout)
     print('Configured profile. SteamVR/ALVR remain stopped; launch when ready.')
 
+def require_built_watcher():
+    watcher=REPO/'.build/scene/AudioSceneWatcher.exe'
+    if not watcher.is_file() or sha256(watcher)!=EXPECTED_WATCHER_SHA:
+        raise Error('Pinned AudioSceneWatcher build missing or changed; build-adapter first.')
+    return watcher
+
 def install_built_adapter(layout):
     artifacts = REPO/'.build'
     native, bridge = artifacts/'native/libd3dmetal-native.dylib', artifacts/'libwine-utm-bridge.dylib'
     if not native.is_file() or not bridge.is_file():
         raise Error('Build outputs missing; run ./scripts/build_adapter.sh before configure.')
+    watcher=require_built_watcher()
+    if not (layout.alvr/'ALVR Dashboard.exe').is_file():
+        raise Error('Install ALVR before configuring the audio watcher.')
     layout.adapter.mkdir(parents=True, exist_ok=True)
-    layout.backup([layout.adapter/native.name,layout.adapter/bridge.name], 'adapter')
+    layout.backup([layout.adapter/native.name,layout.adapter/bridge.name,
+                   layout.alvr/'AudioSceneWatcher.exe'], 'adapter')
     for source in (native,bridge):
         shutil.copy2(source, layout.adapter/source.name)
     # Build links use @loader_path/native; the installed layout keeps both libs together.
     installed = layout.adapter/bridge.name
     run(['install_name_tool','-rpath','@loader_path/native','@loader_path',installed])
     run(['codesign','--force','--sign','-',installed])
+    shutil.copy2(watcher,layout.alvr/'AudioSceneWatcher.exe')
     info = layout.app/'Contents/Info.plist'
     value = plistlib.loads(info.read_bytes())
     block = '; '.join([
@@ -113,6 +128,8 @@ def install_built_adapter(layout):
         'mkdir -p "$DMN_WINE_SOCKET_DIR"', 'chmod 700 "$DMN_WINE_SOCKET_DIR"',
         'export CX_FWD_COMPAT_GL_CTX=1', 'export DMN_ALVR_ACTIVATION_WAIT5=0',
         'export DMN_ALVR_FINGER_GRIP_ONLY=1', 'export DMN_AUDIO_TAP=1',
+        'export DMN_AUDIO_SOURCE_MODE=scene',
+        'export WINESERVER='+shlex.quote(str(layout.engine/'bin/wineserver')),
         'export DMN_AUDIO_CAPTURE_BUFFER_MS=100', 'export DMN_AUDIO_DIAGNOSTICS=0',
         'export WINEESYNC=1', 'export WINEMSYNC=1', 'export DMN_LOG=info',
         'unset DMN_AUDIO_SOURCE_PID',
@@ -120,7 +137,7 @@ def install_built_adapter(layout):
         'export DYLD_INSERT_LIBRARIES='+shlex.quote(str(installed)),
     ])
     value['CLI Custom Commands'] = block
-    value['NSAudioCaptureUsageDescription'] = 'Stream Half-Life: Alyx audio to your own ALVR headset.'
+    value['NSAudioCaptureUsageDescription'] = 'Stream the active SteamVR game audio to your own ALVR headset.'
     value['Program Name and Path'] = '/Program Files (x86)/Steam/Steam.exe'
     value['Program Flags'] = ''
     value['D3DMETAL'] = 1
@@ -160,7 +177,7 @@ def change_settings(layout, changes):
     if layout.session.exists():
         session = json.loads(layout.session.read_text())
         apply_profile(session,prefs)
-        session['session_settings']['audio']['game_audio']['enabled'] = False
+        session['session_settings']['audio']['game_audio']['enabled'] = True
         write_json(layout.session,session)
     write_json(layout.prefs,prefs)
     print(json.dumps(prefs,indent=2))

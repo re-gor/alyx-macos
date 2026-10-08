@@ -23,4 +23,11 @@ This records the original experiment; portable installation scripts are a later 
 
 We did not prove the M4 GPU was the main bottleneck. Encoder-stage includes waits/readback/conversion/codec; game-stage is not a GPU timer. VideoToolbox, Wi-Fi, DXMT replacement and further queue/GPU-event architecture remained research, not deployed playback fixes.
 
-Remaining issues include incomplete thumb-touch animation, generalized NT-handle/fence support, audio source restart lifecycle and clean installation on other machines. This is a vibe-coded hobby experiment, not universal supported Windows VR on Mac.
+Remaining issues include incomplete thumb-touch animation, generalized NT-handle/fence support, audio from separate helper processes and clean installation on other machines. This is a vibe-coded hobby experiment, not universal supported Windows VR on Mac.
+
+## 8 October: automatic audio for Steam launches
+
+17. Registered the Wine audio table before graphics scope becomes ready, so GUI startup does not miss interception. Added a kernel executable-identity guard and retained exact-binary guards.
+18. Added the read-only OpenVR Background watcher, current-scene selection, exact Wine→native PID mapping and stable private tap retargeting. Source selection no longer needs a manual PID file; idle captures no Mac applications.
+19. Added discovery in GetNextPacketSize slot 21. With CPAL checking packet size before GetBuffer, an empty tap otherwise could never discover the new game. Kept borrowed-buffer, Stop/Reset failure and UID/format checks.
+20. The user reported sound fixed in the original installation. Ported source, watcher build, configuration and RU/EN instructions into this repository; packaged build and offline tests passed. New-machine installation and arbitrary-game switching remain separate unvalidated cases.

@@ -42,6 +42,23 @@ OSStatus read_format(AudioObjectID object, AudioObjectPropertySelector selector,
     if (bytes != sizeof(format)) return kAudioHardwareUnspecifiedError;
     out = summarize(format); return noErr;
 }
+OSStatus read_description(AudioObjectID object, CATapDescription* __strong& out) noexcept {
+    out = nil;
+    const AudioObjectPropertyAddress address{kAudioTapPropertyDescription,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    CFTypeRef value = nullptr; UInt32 bytes = sizeof(value);
+    const OSStatus status = AudioObjectGetPropertyData(object, &address, 0, nullptr, &bytes, &value);
+    id description = value ? CFBridgingRelease(value) : nil;
+    if (status != noErr) return status;
+    if (bytes != sizeof(value) || ![description isKindOfClass:[CATapDescription class]])
+        return kAudioHardwareUnspecifiedError;
+    out = description; return noErr;
+}
+bool selected_policy(CATapDescription* value) noexcept {
+    return value && value.UUID && value.privateTap && !value.exclusive &&
+           value.mixdown && !value.mono && value.muteBehavior == CATapUnmuted &&
+           !value.deviceUID;
+}
 class NativeBackend final : public Backend {
 public:
     bool supported() noexcept override {
@@ -60,13 +77,14 @@ public:
     }
     int32_t create_tap(const TapPolicy& policy, uint32_t& object) noexcept override {
         object = kAudioObjectUnknown;
-        if (!policy.process_object || !policy.private_tap || !policy.stereo_mixdown ||
+        if ((policy.empty_target ? policy.process_object != 0 : policy.process_object == 0) ||
+            !policy.private_tap || !policy.stereo_mixdown ||
             policy.exclusive || !policy.playback_unmuted) return kAudioHardwareIllegalOperationError;
         @autoreleasepool {
             if (@available(macOS 14.2, *)) {
                 @try {
                     CATapDescription* description = [[CATapDescription alloc]
-                        initStereoMixdownOfProcesses:@[@(policy.process_object)]];
+                        initStereoMixdownOfProcesses:policy.empty_target ? @[] : @[@(policy.process_object)]];
                     if (!description) return kAudioHardwareUnspecifiedError;
                     description.name = @"Codex ALVR selected-process audio";
                     description.UUID = [NSUUID UUID];
@@ -77,6 +95,42 @@ public:
                     description.muteBehavior = CATapUnmuted;
                     // No macOS26 bundleIDs/processRestore APIs, no global tap.
                     return AudioHardwareCreateProcessTap(description, &object);
+                } @catch (NSException* exception) {
+                    (void)exception; return kAudioHardwareUnspecifiedError;
+                }
+            }
+        }
+        return kAudioHardwareUnsupportedOperationError;
+    }
+    int32_t retarget_tap(uint32_t object, uint32_t process) noexcept override {
+        @autoreleasepool {
+            if (@available(macOS 14.2, *)) {
+                @try {
+                    const AudioObjectPropertyAddress address{kAudioTapPropertyDescription,
+                        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+                    Boolean writable = false;
+                    OSStatus status = AudioObjectIsPropertySettable(object, &address, &writable);
+                    if (status != noErr) return status;
+                    if (!writable) return kAudioHardwareUnsupportedOperationError;
+                    CATapDescription* before = nil;
+                    status = read_description(object, before);
+                    if (status != noErr) return status;
+                    if (!selected_policy(before)) return kAudioHardwareIllegalOperationError;
+                    NSArray<NSNumber*>* processes = process ? @[@(process)] : @[];
+                    CATapDescription* next = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
+                    if (!next) return kAudioHardwareUnspecifiedError;
+                    next.name = before.name; next.UUID = before.UUID;
+                    next.privateTap = YES; next.exclusive = NO;
+                    next.mixdown = YES; next.mono = NO; next.muteBehavior = CATapUnmuted;
+                    // Reuse the existing tap, without global or macOS26 restore APIs.
+                    status = AudioObjectSetPropertyData(object, &address, 0, nullptr, sizeof(next), &next);
+                    if (status != noErr) return status;
+                    CATapDescription* after = nil;
+                    status = read_description(object, after);
+                    if (status != noErr) return status;
+                    if (!selected_policy(after) || ![after.UUID isEqual:before.UUID] ||
+                        ![after.processes isEqualToArray:processes]) return kAudioHardwareIllegalOperationError;
+                    return noErr;
                 } @catch (NSException* exception) {
                     (void)exception; return kAudioHardwareUnspecifiedError;
                 }

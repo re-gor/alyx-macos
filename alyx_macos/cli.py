@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 from .core import DEFAULT_ROOT, Error, Layout, PORT, REPO, assert_stopped, run, sha256
-from .configuration import EXPECTED_ALVR_SHA, change_settings, configure, fix_vulkan
+from .configuration import EXPECTED_ALVR_SHA, EXPECTED_WATCHER_SHA, change_settings, configure, fix_vulkan
 from . import runtime, setup
 
 COMMANDS = {
@@ -29,11 +29,11 @@ COMMANDS = {
     'alvr':'Open ALVR Dashboard.exe directly, without the installer.',
     'alvr-settings':'Open ALVR Dashboard for its Settings tab; print the localhost web URL.',
     'connect-headset':'Create TCP adb forwards and restart only the selected headset ALVR client.',
-    'launch':'Cold-start this prefix, SteamVR, Alyx, its audio source and the USB client.',
+    'launch':'Cold-start this prefix, SteamVR, Alyx and USB; audio follows the active scene automatically.',
     'stop':'Stop only the managed Wine prefix; never kill another wrapper or adb server.',
     'settings':'Show or change supported fields; cold restart is explicit.',
     'fix-vulkan':'Restore the DX11 boot choice with backup while the prefix is stopped.',
-    'audio-status':'Read metadata for the running owned Alyx source; no audio recording.',
+    'audio-status':'Read the owned SteamVR scene observer metadata; no audio recording.',
     'stats':'Read up to60s of ALVR events; report fresh-video cadence/estimated latency.',
     'doctor':'Read local installation checks; never start Wine, adb, SteamVR or recording.',
 }
@@ -51,6 +51,9 @@ def doctor(layout):
             'new_machine_install_tested':False}
     driver=layout.alvr/'bin/win64/driver_alvr_server.dll'
     result['alvr_driver_matches_pinned_build']=driver.is_file() and sha256(driver)==EXPECTED_ALVR_SHA
+    watcher=layout.alvr/'AudioSceneWatcher.exe'
+    result['audio_watcher_matches_pinned_build']=watcher.is_file() and sha256(watcher)==EXPECTED_WATCHER_SHA
+    result['audio_source_mode']='scene'
     if layout.prefs.exists():result['settings']=layout.preferences()
     print(json.dumps(result,indent=2))
 

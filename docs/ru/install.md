@@ -63,7 +63,6 @@ Microsoft x64 v14 ставится официальным интерактивн
 ./scripts/register_alvr.sh
 ./scripts/stop.sh
 ./scripts/add_alvr_to_steam.sh
-./scripts/make_gui_launcher.sh
 ```
 
 Build только компилирует. Configure создаёт бэкапы, ставит адаптеры в эту оболочку и задаёт профиль/native CRT override. Register добавляет `C:\ALVR` в SteamVR данного prefix. ALVR — отдельный streamer/драйвер, не игра из магазина Steam.
@@ -101,4 +100,4 @@ Build только компилирует. Configure создаёт бэкапы
 
 Quest должен быть надет, ALVR — открыт. Запрос macOS на захват подтвердите сами. Проверьте **оба глаза, руки, курок/меню и слышимый звук**. Одного `Connected` недостаточно. При необходимости загрузите save в игре. Дальше: [запуск](usage.md) и [FAQ](faq.md).
 
-Retina/DPI/шрифты: [Wine](wine.md). Сторонняя игра Steam и Finder-ярлык: [запуск](usage.md). Проблема GUI-старта звука ещё исследуется.
+Retina/DPI/шрифты: [Wine](wine.md). Сторонняя игра Steam и Finder-ярлык: [запуск](usage.md). Автоматический звук активной игры и обновление: [звук](audio.md).

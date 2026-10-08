@@ -11,6 +11,7 @@ struct TapPolicy {
     bool stereo_mixdown = true;
     bool exclusive = false;
     bool playback_unmuted = true;
+    bool empty_target = false;
 };
 struct AggregatePolicy {
     bool private_device = true;
@@ -28,6 +29,7 @@ public:
     virtual bool supported() noexcept = 0;
     virtual int32_t lookup_process(int32_t pid, uint32_t& object) noexcept = 0;
     virtual int32_t create_tap(const TapPolicy&, uint32_t& tap) noexcept = 0;
+    virtual int32_t retarget_tap(uint32_t tap, uint32_t process_object) noexcept = 0;
     virtual int32_t tap_uid(uint32_t tap, UID&) noexcept = 0;
     virtual int32_t tap_format(uint32_t tap, dmn_audio_format&) noexcept = 0;
     virtual int32_t create_aggregate(const UID& tap_uid, const AggregatePolicy&,

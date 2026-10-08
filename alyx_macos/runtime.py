@@ -1,4 +1,4 @@
-"""Scoped starts/stops, USB setup and delayed process-specific audio."""
+"""Scoped starts/stops, USB setup and automatic active-scene audio."""
 import json
 import os
 from pathlib import Path
@@ -9,7 +9,7 @@ import time
 
 from .core import Error, PORT, REPO, owned_pids, process_prefix, run, wait_pid, write_json
 from .setup import adb_base
-from .configuration import EXPECTED_ALVR_SHA, game_flags
+from .configuration import EXPECTED_ALVR_SHA, EXPECTED_WATCHER_SHA, game_flags
 from .alvr_api import EventSocket, post, session_flags
 
 def stop(layout):
@@ -117,7 +117,7 @@ def dashboard(layout):
     exe=layout.alvr/'ALVR Dashboard.exe'
     if not exe.is_file():raise Error('ALVR missing; run install-alvr.')
     if not owned_pids(layout,'ALVR Dashboard.exe'):
-        spawn_wine(layout,exe,label='alvr-dashboard',hooks=False)
+        spawn_wine(layout,exe,label='alvr-dashboard')
     print('ALVR Dashboard opened directly. Use Settings; do not run the installer again.')
 
 def open_settings(layout):
@@ -162,14 +162,18 @@ def launch(layout, *, save=None, with_audio=True, serial=None):
     header=crt.read_bytes()[:512]
     if b'Wine builtin DLL' in header or b'Wine built-in DLL' in header:
         raise Error('MSVCP140 is still Wine builtin; install the official Microsoft x64 v14 runtime first.')
+    from .core import sha256
+    watcher=layout.alvr/'AudioSceneWatcher.exe'
+    if with_audio and (not watcher.is_file() or sha256(watcher)!=EXPECTED_WATCHER_SHA):
+        raise Error('Automatic audio watcher missing or changed. Rebuild/configure while stopped.')
     stop(layout)
     session=json.loads(layout.session.read_text())
-    session['session_settings']['audio']['game_audio']['enabled']=False
+    session['session_settings']['audio']['game_audio']['enabled']=with_audio
     write_json(layout.session,session)
     start_steam(layout)
     print('Allowing Steam startup30s before the VR driver to avoid the observed startup race.',flush=True)
     time.sleep(30)
-    spawn_wine(layout,layout.alvr/'ALVR Dashboard.exe',label='alvr-dashboard',hooks=False)
+    spawn_wine(layout,layout.alvr/'ALVR Dashboard.exe',label='alvr-dashboard')
     spawn_wine(layout,layout.steamvr/'bin/win64/vrserver.exe',['-keepalive'],'vrserver')
     wait_pid(layout,'vrserver.exe',45)
     spawn_wine(layout,layout.steamvr/'bin/win64/vrcompositor.exe',label='vrcompositor')
@@ -179,32 +183,27 @@ def launch(layout, *, save=None, with_audio=True, serial=None):
     spawn_wine(layout,game,game_flags(layout.preferences(),save),'alyx')
     pid=wait_pid(layout,'hlvr.exe',60)
     print('Owned Alyx process:',pid,flush=True)
-    if with_audio:
-        probe=REPO/'.build/source_ready_probe'
-        if not probe.is_file():raise Error('Source-ready probe missing; build-adapter first.')
-        deadline=time.monotonic()+90
-        ready=False
-        while time.monotonic()<deadline:
-            result=subprocess.run([str(probe),str(pid),str(layout.prefix)],
-                capture_output=True,text=True,timeout=5)
-            if result.returncode==0 and 'running=1' in result.stdout:
-                ready=True;break
-            time.sleep(1)
-        if not ready:
-            raise Error('Audio source not ready; game remains running with GameAudio off. Inspect logs; restart later, never reuse an old PID.')
-        source=layout.broker/'audio-source.pid'
-        temp=source.with_suffix('.tmp')
-        with temp.open('w') as out:out.write(str(pid)+'\n')
-        temp.chmod(0o600);temp.replace(source)
-        set_audio(layout,True)
+    # The Wine callbacks launch the observer and retarget the private tap.
+    # Do not select/cache a game PID or toggle audio on every scene change.
     connect_headset(layout,serial)
     print('Started. Approve any macOS audio-capture request yourself. Success requires image, hands and audible sound inside the headset.')
 
 def source_status(layout):
-    pids=owned_pids(layout,'hlvr.exe')
-    if len(pids)!=1:raise Error('Exactly one running owned Alyx is needed')
-    probe=REPO/'.build/source_ready_probe'
-    run([probe,str(pids[0]),layout.prefix],timeout=5)
+    servers=owned_pids(layout,'vrserver.exe')
+    if len(servers)!=1:raise Error('Exactly one running owned vrserver is needed')
+    file=layout.broker/f'active-scene-{servers[0]}.state'
+    if not file.is_file():
+        print('Scene observer has not published yet. Check Game audio, active Quest and adapter guards.')
+        return
+    if file.is_symlink() or file.stat().st_uid!=os.getuid() or file.stat().st_size>512:
+        raise Error('Unexpected audio-state file; refusing read')
+    values=dict(re.findall(r'\b(version|wine_pid|native_pid|start_time|generation|ready|observed_time)=(\d+)\b',file.read_text()))
+    if set(values)!={'version','wine_pid','native_pid','start_time','generation','ready','observed_time'}:
+        raise Error('Invalid scene observer state')
+    state={k:int(v) for k,v in values.items()}
+    state['observation_age_s']=(time.time()+11644473600)-state['observed_time']/10000000
+    print(json.dumps(state,indent=2))
+    print('ready proves process mapping only, not audible output. Old observations can be stale.')
 
 def stats(layout,seconds=30):
     assert_api_owner(layout)

@@ -63,7 +63,6 @@ The Microsoft x64 v14 runtime uses its official interactive installer. Approve i
 ./scripts/register_alvr.sh
 ./scripts/stop.sh
 ./scripts/add_alvr_to_steam.sh
-./scripts/make_gui_launcher.sh
 ```
 
 Build only compiles. Configure backs up files, installs adapters into this wrapper and sets the tested profile/native CRT override. Register adds `C:\ALVR` to this prefix's SteamVR. ALVR is a standalone streamer/driver, not a Steam-store app.
@@ -101,4 +100,4 @@ It stays in private local settings. Native Mac adb creates the tunnels; Windows 
 
 Wear Quest and keep ALVR foreground. Approve any macOS capture request yourself. Verify **both-eye image, hands, trigger/menu interaction and audible game sound**. `Connected` alone is not acceptance. Load a save through the game menu if required. Continue with [usage](usage.md) and [FAQ](faq.md).
 
-Wine Retina/DPI/font details: [Wine configuration](wine.md). Steam non-Steam shortcut and Finder launcher: [usage](usage.md). The current GUI audio-start issue is still under investigation.
+Wine Retina/DPI/font details: [Wine configuration](wine.md). Steam non-Steam shortcut and Finder launcher: [usage](usage.md). Automatic active-game audio and updating an existing managed installation: [audio](audio.md).

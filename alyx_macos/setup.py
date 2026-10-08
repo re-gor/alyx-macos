@@ -168,7 +168,7 @@ def build_adapter(layout, *, framework=None, tools_dir=None, jobs=2):
          '-c',bridge/'audio/process_tap_native.mm','-o',obj],timeout=120)
     sources = ['wine_bridge.cpp','alvr_error_bridge.cpp','alvr_frame_trace.cpp',
         'alvr_activation_bridge.cpp','alvr_finger_bridge.cpp','compositor_frame_trace.cpp',
-        'client_frame_trace.cpp','wine_audio_bridge.cpp','audio/process_tap.cpp']
+        'client_frame_trace.cpp','wine_audio_bridge.cpp','wine_scene_source.cpp','audio/process_tap.cpp']
     run(['clang++','-arch','x86_64','-std=c++17','-mmacosx-version-min=14.0','-dynamiclib',
          *[bridge/s for s in sources],obj,'-framework','CoreAudio','-framework','Foundation',
          '-L'+str(native),'-ld3dmetal-native','-Wl,-rpath,@loader_path/native',
@@ -179,6 +179,7 @@ def build_adapter(layout, *, framework=None, tools_dir=None, jobs=2):
     run(['lipo','-create',out/'bridge-x86_64.dylib',out/'bridge-arm64.dylib',
          '-output',out/'libwine-utm-bridge.dylib'])
     run(['codesign','--force','--sign','-',out/'libwine-utm-bridge.dylib'])
+    run([sys.executable,REPO/'src/scene/build_watcher.py'],timeout=120)
     run(['clang++','-arch','x86_64','-std=c++17','-mmacosx-version-min=14.0',
          REPO/'src/probes/source_ready_probe.cpp','-framework','CoreAudio','-framework','Foundation',
          '-o',out/'source_ready_probe'],timeout=120)

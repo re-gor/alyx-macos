@@ -8,6 +8,13 @@
 #include <condition_variable>
 
 struct dmn_audio_tap { bool ready; };
+extern "C" bool wine_bridge_own_pe_name(char* name,size_t size) {
+    if (size<13) return false;
+    strcpy(name,"vrserver.exe");return true;
+}
+bool dmn_scene_source_snapshot(DmnSceneSourceSnapshot* out) noexcept {
+    *out={};return false;
+}
 namespace {
 unsigned creates=0, destroys=0, original_calls=0;
 bool fail_create=false, fail_cleanup=false, invalid_format=false;
@@ -103,6 +110,12 @@ extern "C" dmn_audio_status dmn_audio_tap_destroy(dmn_audio_tap** inout,
     *inout=nullptr;
     return DMN_AUDIO_OK;
 }
+extern "C" dmn_audio_status dmn_audio_tap_create_idle(dmn_audio_tap** out,dmn_audio_error* error) {
+    return dmn_audio_tap_create(123,out,error);
+}
+extern "C" dmn_audio_status dmn_audio_tap_retarget_pid(dmn_audio_tap*,int32_t,dmn_audio_error*) {
+    return DMN_AUDIO_OK;
+}
 extern "C" dmn_audio_status dmn_audio_tap_get_format(const dmn_audio_tap* tap,
                                                      dmn_audio_format* out) {
     assert(tap && tap->ready);
@@ -125,6 +138,7 @@ extern "C" dmn_audio_status dmn_audio_tap_get_uid(const dmn_audio_tap* tap,
 extern "C" const char* dmn_audio_status_name(dmn_audio_status) { return "fake"; }
 
 int main(int argc, char** argv) {
+    unsetenv("DMN_AUDIO_SOURCE_MODE");
     assert(argc==2);
     assert(file_matches(argv[1]));
     assert(!file_matches("/nonexistent/winecoreaudio.so"));

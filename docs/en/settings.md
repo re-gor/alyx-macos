@@ -54,3 +54,5 @@ Separate controls:
 ```
 
 Keep save/scene/head motion similar, finish alignment before measuring, and change one variable per comparison. Fresh decoded-video cadence is not pure game GPU FPS.
+
+When starting with Steam's ordinary Play button, copy the desired `+vr_msaa VALUE` and fixed-fidelity options into the game's Steam Launch Options as described in [usage](usage.md). The settings script changes this project's launcher preferences; it does not rewrite your Steam account files.

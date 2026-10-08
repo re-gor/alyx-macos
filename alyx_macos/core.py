@@ -201,7 +201,8 @@ class Layout:
             env.update(DMN_WINE_SHARING='1', DMN_WINE_SOCKET_DIR=str(self.broker),
                 DYLD_INSERT_LIBRARIES=str(bridge), DMN_LOG='info',
                 DMN_ALVR_ACTIVATION_WAIT5='0', DMN_ALVR_FINGER_GRIP_ONLY='1',
-                DMN_AUDIO_TAP='1', DMN_AUDIO_CAPTURE_BUFFER_MS='100', DMN_AUDIO_DIAGNOSTICS='0')
+                DMN_AUDIO_TAP='1', DMN_AUDIO_SOURCE_MODE='scene',
+                DMN_AUDIO_CAPTURE_BUFFER_MS='100', DMN_AUDIO_DIAGNOSTICS='0')
             env.pop('DMN_AUDIO_SOURCE_PID', None)
         return env
 

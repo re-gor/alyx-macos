@@ -10,8 +10,11 @@ struct dmn_audio_tap {
     uint32_t aggregate_id = 0;
     bool ready = false;
     dmn_audio::UID uid{};
+    dmn_audio::UID tap_uid{};
     size_t uid_bytes = 0;
     dmn_audio_format format{};
+    int32_t target_pid = 0;
+    uint32_t target_process = 0;
 };
 static_assert(sizeof(dmn_audio_format) == 48, "public format ABI drift");
 static_assert(sizeof(dmn_audio_error) == 16, "public error ABI drift");
@@ -84,11 +87,12 @@ bool same_format(const dmn_audio_format& a, const dmn_audio_format& b) noexcept 
 }
 } // namespace
 
-extern "C" dmn_audio_status dmn_audio_tap_create(int32_t pid, dmn_audio_tap** out,
-                                                 dmn_audio_error* supplied) {
+namespace {
+dmn_audio_status create_impl(int32_t pid, bool idle, dmn_audio_tap** out,
+                            dmn_audio_error* supplied) {
     dmn_audio_error error{};
     const auto finish = [&](dmn_audio_status status) { if (supplied) *supplied = error; return status; };
-    if (!out || *out || pid <= 0) {
+    if (!out || *out || (!idle && pid <= 0)) {
         error.stage = DMN_AUDIO_STAGE_GATE; return finish(DMN_AUDIO_INVALID_ARGUMENT);
     }
     const char* enabled = std::getenv("DMN_AUDIO_TAP");
@@ -106,12 +110,15 @@ extern "C" dmn_audio_status dmn_audio_tap_create(int32_t pid, dmn_audio_tap** ou
     error.stage = DMN_AUDIO_STAGE_OS;
     if (!tap->backend->supported()) return fail(DMN_AUDIO_UNSUPPORTED_OS);
     uint32_t process = 0;
-    error.stage = DMN_AUDIO_STAGE_PID_LOOKUP;
-    error.os_status = tap->backend->lookup_process(pid, process);
-    if (error.os_status) return fail(DMN_AUDIO_HAL_FAILURE);
-    if (!process) return fail(DMN_AUDIO_PRODUCER_NOT_FOUND);
+    if (!idle) {
+        error.stage = DMN_AUDIO_STAGE_PID_LOOKUP;
+        error.os_status = tap->backend->lookup_process(pid, process);
+        if (error.os_status) return fail(DMN_AUDIO_HAL_FAILURE);
+        if (!process) return fail(DMN_AUDIO_PRODUCER_NOT_FOUND);
+    }
     error.stage = DMN_AUDIO_STAGE_CREATE_TAP;
-    error.os_status = tap->backend->create_tap({process}, tap->tap_id);
+    dmn_audio::TapPolicy policy{process};policy.empty_target=idle;
+    error.os_status = tap->backend->create_tap(policy, tap->tap_id);
     if (error.os_status || !tap->tap_id) return fail(DMN_AUDIO_HAL_FAILURE);
     dmn_audio::UID tap_uid{}; size_t tap_uid_bytes = 0;
     error.stage = DMN_AUDIO_STAGE_TAP_UID;
@@ -138,8 +145,76 @@ extern "C" dmn_audio_status dmn_audio_tap_create(int32_t pid, dmn_audio_tap** ou
     tap->format.struct_size = sizeof(dmn_audio_format);
     tap->format.version = DMN_AUDIO_FORMAT_VERSION;
     tap->format.reserved = 0;
+    tap->tap_uid=tap_uid;tap->target_pid=pid;tap->target_process=process;
     tap->ready = true; *out = tap; error = {};
     return finish(DMN_AUDIO_OK);
+}
+dmn_audio_status validate_target(dmn_audio_tap& tap,dmn_audio_error& error) {
+    error.stage=DMN_AUDIO_STAGE_VALIDATE_TARGET;
+    dmn_audio::UID tap_uid{},aggregate_uid{};size_t bytes=0;
+    error.os_status=tap.backend->tap_uid(tap.tap_id,tap_uid);
+    if (error.os_status) return DMN_AUDIO_HAL_FAILURE;
+    error.os_status=tap.backend->aggregate_uid(tap.aggregate_id,aggregate_uid);
+    if (error.os_status) return DMN_AUDIO_HAL_FAILURE;
+    if (!dmn_audio::valid_uid(tap_uid,bytes) || !dmn_audio::valid_uid(aggregate_uid,bytes) ||
+        tap_uid!=tap.tap_uid || aggregate_uid!=tap.uid) return DMN_AUDIO_BAD_UID;
+    dmn_audio_format a{},b{};
+    error.os_status=tap.backend->tap_format(tap.tap_id,a);
+    if (error.os_status) return DMN_AUDIO_HAL_FAILURE;
+    error.os_status=tap.backend->aggregate_format(tap.aggregate_id,b);
+    if (error.os_status) return DMN_AUDIO_HAL_FAILURE;
+    if (!dmn_audio::valid_format(a) || !dmn_audio::valid_format(b) ||
+        !same_format(a,tap.format) || !same_format(b,tap.format)) return DMN_AUDIO_UNSUPPORTED_FORMAT;
+    return DMN_AUDIO_OK;
+}
+}
+extern "C" dmn_audio_status dmn_audio_tap_create(int32_t pid,dmn_audio_tap** out,dmn_audio_error* error) {
+    return create_impl(pid,false,out,error);
+}
+extern "C" dmn_audio_status dmn_audio_tap_create_idle(dmn_audio_tap** out,dmn_audio_error* error) {
+    return create_impl(0,true,out,error);
+}
+extern "C" dmn_audio_status dmn_audio_tap_retarget_pid(dmn_audio_tap* tap,int32_t pid,
+                                                       dmn_audio_error* supplied) {
+    dmn_audio_error error{};
+    const auto finish=[&](dmn_audio_status status){if(supplied)*supplied=error;return status;};
+    if (!tap || pid<0) {error.stage=DMN_AUDIO_STAGE_GATE;return finish(DMN_AUDIO_INVALID_ARGUMENT);}
+    const char* enabled=std::getenv("DMN_AUDIO_TAP");
+    if (!enabled || std::strcmp(enabled,"1")) {error.stage=DMN_AUDIO_STAGE_GATE;return finish(DMN_AUDIO_DISABLED);}
+    if (!tap->ready) return finish(DMN_AUDIO_NOT_READY);
+    // Clear the old target before resolving a different process. The consumer
+    // is already suspended by contract; no fallback can continue the old audio.
+    error.stage=DMN_AUDIO_STAGE_DETACH_TARGET;
+    error.os_status=tap->backend->retarget_tap(tap->tap_id,0);
+    tap->target_pid=0;tap->target_process=0;
+    if (error.os_status) {tap->ready=false;return finish(DMN_AUDIO_TARGET_UNSAFE);}
+    auto status=validate_target(*tap,error);
+    if (status!=DMN_AUDIO_OK) {tap->ready=false;return finish(status);}
+    if (!pid) {error={};return finish(DMN_AUDIO_OK);}
+    uint32_t process=0;error.stage=DMN_AUDIO_STAGE_PID_LOOKUP;
+    error.os_status=tap->backend->lookup_process(pid,process);
+    if (error.os_status) return finish(DMN_AUDIO_HAL_FAILURE);
+    if (!process) return finish(DMN_AUDIO_PRODUCER_NOT_FOUND);
+    error.stage=DMN_AUDIO_STAGE_SET_TARGET;
+    error.os_status=tap->backend->retarget_tap(tap->tap_id,process);
+    status=error.os_status ? DMN_AUDIO_HAL_FAILURE : validate_target(*tap,error);
+    if (status!=DMN_AUDIO_OK) {
+        const auto primary=error;
+        const int32_t detached=tap->backend->retarget_tap(tap->tap_id,0);
+        tap->ready=false;
+        if (detached) {
+            error=primary;error.cleanup_stage=DMN_AUDIO_STAGE_DETACH_TARGET;
+            error.cleanup_os_status=detached;return finish(DMN_AUDIO_TARGET_UNSAFE);
+        }
+        dmn_audio_error rollback{};
+        const auto valid=validate_target(*tap,rollback);
+        error=primary;
+        if (valid!=DMN_AUDIO_OK) {
+            error.cleanup_stage=DMN_AUDIO_STAGE_VALIDATE_TARGET;error.cleanup_os_status=rollback.os_status;
+        } else tap->ready=true;
+        return finish(status);
+    }
+    tap->target_pid=pid;tap->target_process=process;error={};return finish(DMN_AUDIO_OK);
 }
 
 extern "C" dmn_audio_status dmn_audio_tap_get_uid(const dmn_audio_tap* tap, char* buffer,
@@ -180,6 +255,7 @@ extern "C" const char* dmn_audio_status_name(dmn_audio_status status) {
         DMN_NAME(DMN_AUDIO_UNSUPPORTED_FORMAT); DMN_NAME(DMN_AUDIO_BUFFER_TOO_SMALL);
         DMN_NAME(DMN_AUDIO_NOT_READY); DMN_NAME(DMN_AUDIO_CLEANUP_FAILED);
         DMN_NAME(DMN_AUDIO_OUT_OF_MEMORY); DMN_NAME(DMN_AUDIO_INTERNAL_ERROR);
+        DMN_NAME(DMN_AUDIO_TARGET_UNSAFE);
 #undef DMN_NAME
         default: return "DMN_AUDIO_UNKNOWN_STATUS";
     }
