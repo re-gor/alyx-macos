@@ -10,6 +10,7 @@
 | DPI | `HKCU\Control Panel\Desktop\LogPixels=192`, 200% of96 DPI |
 | Font smoothing | enabled; type2, gamma1400, orientation1, matching the observed reference |
 | Synchronization | `WINEESYNC=1`, `WINEMSYNC=1`, also SDK plist flags |
+| Desktop Steam | `Info.plist` → `Program Flags=-vrdisable`; keeps separate SteamVR/game VR active |
 | Graphics | D3DMetal on, DXVK off |
 | Architecture/persona | 64-bit prefix, Wine win10, Windows10 Pro registry label; not a Windows OS installation/license |
 | CRT | `msvcp140=native,builtin` only for `vrserver.exe` |

@@ -9,7 +9,7 @@ import sys
 import tempfile
 
 from .core import Error, REPO, assert_stopped, check_platform, download, extract, run, sha256, write_json
-from .configuration import EXPECTED_ALVR_SHA
+from .configuration import DESKTOP_STEAM_FLAGS, EXPECTED_ALVR_SHA
 
 def install_wine(layout):
     check_platform()
@@ -32,7 +32,7 @@ def install_wine(layout):
         value = plistlib.loads(info.read_bytes())
         value.update(D3DMETAL=1,DXVK=0)
         value['Program Name and Path'] = '/Program Files (x86)/Steam/Steam.exe'
-        value['Program Flags'] = ''
+        value['Program Flags'] = DESKTOP_STEAM_FLAGS
         value['Skip Gecko'] = 1
         value['Skip Mono'] = 1
         value['CFBundleIdentifier'] = 'io.github.re-gor.alyx-macos'

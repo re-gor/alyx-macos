@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 from .core import DEFAULT_ROOT, Error, Layout, PORT, REPO, assert_stopped, run, sha256
-from .configuration import EXPECTED_ALVR_SHA, EXPECTED_WATCHER_SHA, change_settings, configure, fix_vulkan
+from .configuration import EXPECTED_ALVR_SHA, EXPECTED_WATCHER_SHA, change_settings, configure, fix_steam_startup, fix_vulkan
 from . import runtime, setup
 
 COMMANDS = {
@@ -33,6 +33,7 @@ COMMANDS = {
     'stop':'Stop only the managed Wine prefix; never kill another wrapper or adb server.',
     'settings':'Show or change supported fields; cold restart is explicit.',
     'fix-vulkan':'Restore the DX11 boot choice with backup while the prefix is stopped.',
+    'fix-steam-startup':'Back up and add -vrdisable to desktop Steam only, while this prefix is stopped.',
     'audio-status':'Read the owned SteamVR scene observer metadata; no audio recording.',
     'stats':'Read up to60s of ALVR events; report fresh-video cadence/estimated latency.',
     'doctor':'Read local installation checks; never start Wine, adb, SteamVR or recording.',
@@ -132,6 +133,7 @@ def main(argv=None):
         elif name=='launch':runtime.launch(layout,save=args.save,with_audio=not args.no_audio,serial=args.serial)
         elif name=='stop':runtime.stop(layout)
         elif name=='fix-vulkan':fix_vulkan(layout.managed())
+        elif name=='fix-steam-startup':fix_steam_startup(layout)
         elif name=='audio-status':runtime.source_status(layout.managed())
         elif name=='stats':runtime.stats(layout.managed(),args.seconds)
         elif name=='settings':

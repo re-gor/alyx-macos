@@ -48,6 +48,23 @@ Manual alternative: Steam → Games → Add a Non-Steam Game → Browse → `C:\
 
 The observer runs in the background and selects only the active scene process. With no eligible game, the source is empty. The implementation can retarget without restarting vrserver; switching between arbitrary VR titles has not been accepted on a headset. Details and upgrade steps: [audio](audio.md).
 
+## Upgrade the Steam startup fix
+
+New wrappers and `configure.sh` save `-vrdisable` in **Info.plist → Program Flags** for **Steam.exe**. Finder and `start_steam.sh` use that saved setting. It disables the desktop Steam client's own OpenVR integration; Alyx still uses OpenVR → SteamVR → ALVR → Quest. Do not add this flag to Alyx's Launch Options, SteamVR or ALVR.
+
+For an existing installation, pull the update, finish your current game session and run:
+
+```sh
+git pull --ff-only
+./scripts/stop.sh
+./scripts/fix_steam_startup.sh
+./scripts/start_steam.sh
+```
+
+Use the same `--root PATH` on all three scripts if you installed elsewhere. `stop.sh` closes this managed prefix, including any running game. The fix command itself starts or stops nothing, refuses a live prefix or a wrapper targeting another program, backs up Info.plist under `backups/steam-startup-*`, and appends the flag once while preserving existing Steam arguments and other settings. No adapter rebuild, profile reset or per-game launcher is required. Continue with the normal Steam workflow above.
+
+In the original installation with Steam build **1791918634** and SteamVR **2.17.10**, this restored the normal Play button. SteamVR's connection to Steam took 0.14 seconds, compared with repeated approximately 5-second timeouts before the workaround. The exact blocked call and whether a Steam update triggered it remain unproven; this does not fix every later SteamVR crash.
+
 ## Scripted launch
 
 `launch_alyx.sh` remains an optional cold bootstrap: it refuses another running VR prefix, stops only this prefix, starts Steam/ALVR/vrserver/compositor, checks Steam stability, starts Alyx with saved fidelity/MSAA and reconnects USB. Game audio is enabled before the game and follows the scene automatically. `--no-audio` keeps Game audio off for diagnosis.

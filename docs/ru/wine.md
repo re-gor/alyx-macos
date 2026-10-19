@@ -10,6 +10,7 @@
 | DPI | `HKCU\Control Panel\Desktop\LogPixels=192`, 200% от96 DPI |
 | Сглаживание шрифтов | включено; type2, gamma1400, orientation1 как в референсе |
 | Синхронизация | `WINEESYNC=1`, `WINEMSYNC=1` и флаги SDK plist |
+| Обычный Steam | `Info.plist` → `Program Flags=-vrdisable`; VR в отдельных SteamVR/игре остаётся доступен |
 | Графика | D3DMetal включён, DXVK выключен |
 | Архитектура/персона | 64-bit prefix, Wine win10, registry label Windows10 Pro; это не установка/лицензия Windows OS |
 | CRT | `msvcp140=native,builtin` только для `vrserver.exe` |

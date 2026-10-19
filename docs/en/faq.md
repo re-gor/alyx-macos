@@ -12,6 +12,10 @@ Finish Quest's tracking/play-space setup first. Keep ALVR foreground and take bo
 
 Connected is a control connection, not proof of pixels. Check pinned engine/ALVR, adapter loading and `allowDisplayLockedMode=true`. Run `doctor.sh`, then cold `launch_alyx.sh`. The original teal case involved shared-resource problems and Wine's false locked-session state. Avoid random backend changes or removing GPU completion waits.
 
+## Steam becomes unresponsive after starting SteamVR; Play does nothing
+
+Apply the [Steam startup fix](usage.md#upgrade-the-steam-startup-fix). The wrapper must pass `-vrdisable` to desktop **Steam.exe**, rather than to the game. This bypasses the client's own OpenVR initialization while separate SteamVR/game processes keep working. New installs and `configure.sh` include it; an older wrapper needs the one-time fix. A different SteamVR crash still needs its own diagnosis.
+
 ## SteamVR 461 or critical failure
 
 Check Wine 10.0_6/template 1.0.11 and the ALVR DLL hash. Inspect owned `logs/vrserver.log` and `vrcompositor.log` for missing adapters or rejected versions. Rebuild/configure while stopped, then cold-start. New SteamVR/Wine may require ABI work; do not remove guards to load an unknown binary.

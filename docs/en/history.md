@@ -31,3 +31,9 @@ Remaining issues include incomplete thumb-touch animation, generalized NT-handle
 18. Added the read-only OpenVR Background watcher, current-scene selection, exact Wine→native PID mapping and stable private tap retargeting. Source selection no longer needs a manual PID file; idle captures no Mac applications.
 19. Added discovery in GetNextPacketSize slot 21. With CPAL checking packet size before GetBuffer, an empty tap otherwise could never discover the new game. Kept borrowed-buffer, Stop/Reset failure and UID/format checks.
 20. The user reported sound fixed in the original installation. Ported source, watcher build, configuration and RU/EN instructions into this repository; packaged build and offline tests passed. New-machine installation and arbitrary-game switching remain separate unvalidated cases.
+
+## 16 October: desktop Steam startup workaround
+
+21. Investigated the unresponsive Steam Play button after SteamVR started. Two Steam threads remained in waits and SteamVR repeatedly timed out connecting to Steam; the exact blocked call was not identified.
+22. Found `-vrdisable` in the installed Steam client and saved it only for desktop Steam. With the original synchronization settings still at `WINEESYNC=1`/`WINEMSYNC=1`, the normal Play button worked and Alyx ran through separate SteamVR/ALVR processes. This is a workaround for desktop Steam's own OpenVR path, not a Wine implementation patch or a fix for all SteamVR crashes.
+23. Added the flag to wrapper creation/configuration and a backed-up, stopped-prefix upgrade command. The packaged Python upgrade is checked offline; a complete fresh-machine/headset installation remains unvalidated.

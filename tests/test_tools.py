@@ -89,6 +89,7 @@ class ToolsTests(unittest.TestCase):
         self.assertEqual(flags[flags.index('+vr_msaa')+1],'4')
         self.assertEqual(flags[flags.index('+vr_fidelity_level_auto')+1],'0')
         self.assertIn('-dx11',flags)
+        self.assertNotIn('-vrdisable',flags)
         self.assertEqual(flags[-2:],['+load','s0/quick'])
 
     def test_dry_run_never_launches_or_creates_installation(self):
@@ -165,7 +166,10 @@ class ToolsTests(unittest.TestCase):
                  patch('alyx_macos.configuration.run'),\
                  contextlib.redirect_stdout(io.StringIO()):
                 install_built_adapter(layout)
-            exported=plistlib.loads(info.read_bytes())['CLI Custom Commands']
+            configured=plistlib.loads(info.read_bytes())
+            self.assertEqual(configured['Program Flags'],'-vrdisable')
+            self.assertEqual(configured['Program Name and Path'],'/Program Files (x86)/Steam/Steam.exe')
+            exported=configured['CLI Custom Commands']
             self.assertIn('export DMN_AUDIO_SOURCE_MODE=scene',exported)
             self.assertIn('export WINESERVER=',exported)
             self.assertEqual((layout.alvr/'AudioSceneWatcher.exe').read_bytes(),b'fake watcher')

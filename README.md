@@ -10,6 +10,8 @@ The original installation displayed Alyx scenes, tracked hands/buttons and strea
 
 **Audio update, 8 October 2026:** the user reports sound fixed in the original installation. This snapshot includes automatic active-game capture for the Steam → ALVR → SteamVR → game workflow; no manual audio PID selection. See [audio and upgrading](docs/en/audio.md). Other VR games and a complete fresh-machine installation remain unvalidated.
 
+**Steam startup update, 16 October 2026:** desktop Steam now starts with `-vrdisable` to work around the observed unresponsive Play button after SteamVR starts. SteamVR and Alyx still run separately. Existing installations can [apply only this fix](docs/en/usage.md#upgrade-the-steam-startup-fix) without rebuilding adapters.
+
 ## Guides
 
 1. [Install Wine, Steam, SteamVR, ALVR and the headset client](docs/en/install.md).

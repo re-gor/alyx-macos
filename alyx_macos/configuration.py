@@ -9,6 +9,28 @@ from .core import Error, REPO, assert_stopped, run, sha256, write_json
 
 EXPECTED_ALVR_SHA = '5b2dc0012254fa3c45268ed655c3f589b2d460a62907c620670cfb5d22a48fa8'
 EXPECTED_WATCHER_SHA = 'c4daa99a3efa4873d7a6e79c78c5c706cbeffd0e497cec7278b847bdc3409102'
+DESKTOP_STEAM_FLAGS = '-vrdisable'
+
+def fix_steam_startup(layout):
+    """Persist the desktop Steam workaround without rebuilding or starting Wine."""
+    layout.managed()
+    assert_stopped(layout)
+    info = layout.app/'Contents/Info.plist'
+    value = plistlib.loads(info.read_bytes())
+    program = value.get('Program Name and Path', '')
+    if not isinstance(program, str) or program.replace('\\', '/').lower() != '/program files (x86)/steam/steam.exe':
+        raise Error('Wrapper default program is not Steam.exe; refusing to change another program\'s flags.')
+    flags = value.get('Program Flags', '')
+    if not isinstance(flags, str):
+        raise Error('Expected string Steam Program Flags; refusing malformed configuration.')
+    if DESKTOP_STEAM_FLAGS in (flag.lower() for flag in shlex.split(flags)):
+        print('Desktop Steam already uses -vrdisable. No changes.')
+        return
+    value['Program Flags'] = (flags.rstrip()+' '+DESKTOP_STEAM_FLAGS).lstrip()
+    backup = layout.backup([info], 'steam-startup')
+    info.write_bytes(plistlib.dumps(value, sort_keys=False))
+    print('Saved -vrdisable for desktop Steam only. SteamVR/game flags are unchanged.')
+    print('Backup:', backup)
 
 def wine_registry_values():
     desktop=r'HKCU\Control Panel\Desktop'
@@ -139,7 +161,7 @@ def install_built_adapter(layout):
     value['CLI Custom Commands'] = block
     value['NSAudioCaptureUsageDescription'] = 'Stream the active SteamVR game audio to your own ALVR headset.'
     value['Program Name and Path'] = '/Program Files (x86)/Steam/Steam.exe'
-    value['Program Flags'] = ''
+    value['Program Flags'] = DESKTOP_STEAM_FLAGS
     value['D3DMETAL'] = 1
     value['DXVK'] = 0
     value['WINEESYNC'] = 1
